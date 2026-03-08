@@ -1,0 +1,55 @@
+# Vim / editor
+*.swp
+*.swo
+*~
+
+# Build artifacts
+build/
+Debug/
+Release/
+cmake-build-*/
+Desktop-Debug/
+CMakeFiles/
+CMakeCache.txt
+build.ninja
+.ninja_deps
+.ninja_log
+cmake_install.cmake
+qtcsettings.cmake
+compile_commands.json
+
+# Qt / Creator user files
+*.user
+*.pro.user
+*.autosave
+
+# Binary / executable / objects
+*.o
+*.a
+*.so
+*.out
+*.elf
+*.bin
+*.hex
+a.out
+
+# DB / runtime data
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+
+# Generated Qt/CMake internals
+.cmake/
+.qt/
+.qtc/
+*_autogen/
+
+# MQTT external/build dirs
+mqtt-build/
+
+# OS
+.DS_Store
+Thumbs.db
