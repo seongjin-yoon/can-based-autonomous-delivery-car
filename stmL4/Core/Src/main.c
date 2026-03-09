@@ -3,9 +3,14 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : CAN 키보드 제어 + PID 속도 제어
+  * RPi1 → STM32 CAN 0x010 (주행명령)
+  * RPi1 → STM32 CAN 0x011 (E-Stop)
+  * STM32 → RPi1 CAN 0x100 (속도 피드백 50ms)
+  * STM32 → RPi1 CAN 0x200 (Heartbeat 100ms)
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 #include "main.h"
 #include "can.h"
 #include "i2c.h"
@@ -22,29 +27,34 @@
 /* USER CODE BEGIN PD */
 #define PWM_MAX             999
 #define PWM_MIN             0
-#define PWM_DEFAULT         500
-#define PWM_OFFSET          300.0f
+#define PWM_DEFAULT         350
+#define PWM_OFFSET          350.0f
+
+// ★ 회전 PWM 추가
+#define PWM_TURN            999
+#define PWM_TURN_SLOW       800
+
+// 엔코더 (JGB37-520) - 1320 CPR
 #define PULSE_PER_REV       5280
 #define PID_INTERVAL_MS     10
 
 #define TARGET_RPM_MAX      350.0f
 #define TARGET_RPM_MIN      0.0f
-#define TARGET_RPM_DEFAULT  60.0f
+#define TARGET_RPM_DEFAULT  250.0f
 
+// PID 게인
 #define KP                  0.5f
-#define KI                  0.0f
+#define KI                  0.05f
 #define KD                  0.0f
-#define INTEGRAL_LIMIT      150.0f
+#define INTEGRAL_LIMIT      200.0f
 
-#define PWM_FORWARD         400
-#define PWM_TURN            990
-#define PWM_TURN_SLOW       800
-
+// CAN ID
 #define CAN_ID_CMD          0x010
 #define CAN_ID_ESTOP        0x011
 #define CAN_ID_SPEED        0x100
 #define CAN_ID_HEARTBEAT    0x200
 
+// CAN 방향 코드
 #define DIR_STOP            0
 #define DIR_FORWARD         1
 #define DIR_BACKWARD        2
@@ -52,8 +62,11 @@
 #define DIR_RIGHT           4
 #define DIR_UTURN           5
 
+// CAN TX 주기
 #define CAN_SPEED_PERIOD_MS      50
 #define CAN_HEARTBEAT_PERIOD_MS  100
+
+// CAN 타임아웃
 #define CAN_CMD_TIMEOUT_MS       5000
 /* USER CODE END PD */
 
@@ -62,11 +75,14 @@ uint8_t  rx_data;
 uint8_t  cmd = 0;
 char     uart_buf[160];
 
+// 엔코더
 volatile int16_t enc_left_prev  = 0;
 volatile int16_t enc_right_prev = 0;
 volatile float   rpm_left       = 0.0f;
 volatile float   rpm_right      = 0.0f;
-volatile float   target_rpm     = TARGET_RPM_DEFAULT;
+
+// PID
+volatile float target_rpm = TARGET_RPM_DEFAULT;
 
 typedef struct {
     float kp, ki, kd;
@@ -85,6 +101,7 @@ volatile uint8_t  pid_enable    = 0;
 
 volatile uint8_t current_dir = DIR_STOP;
 
+// CAN
 CAN_TxHeaderTypeDef can_tx_header;
 CAN_RxHeaderTypeDef can_rx_header;
 uint8_t  can_tx_data[8];
@@ -98,6 +115,7 @@ volatile uint16_t can_timeout_cnt   = 0;
 /* USER CODE END PV */
 
 void SystemClock_Config(void);
+
 /* USER CODE BEGIN PFP */
 void CAN_Config(void);
 void CAN_TX_Speed(void);
@@ -128,15 +146,19 @@ static inline int16_t diff16(int16_t now, int16_t prev)
 float PID_Compute(PID_t *pid, float target, float current)
 {
     float error = target - current;
+
     pid->integral += error * (PID_INTERVAL_MS / 1000.0f);
     if (pid->integral >  INTEGRAL_LIMIT) pid->integral =  INTEGRAL_LIMIT;
     if (pid->integral < -INTEGRAL_LIMIT) pid->integral = -INTEGRAL_LIMIT;
+
     float derivative = (error - pid->prev_error) / (PID_INTERVAL_MS / 1000.0f);
     pid->prev_error  = error;
+
     pid->output = PWM_OFFSET
                 + (pid->kp * error)
                 + (pid->ki * pid->integral)
                 + (pid->kd * derivative);
+
     return pid->output;
 }
 
@@ -151,10 +173,13 @@ void Encoder_Update(void)
 {
     int16_t left_now  = (int16_t)__HAL_TIM_GET_COUNTER(&htim5);
     int16_t right_now = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+
     int16_t left_diff  = diff16(left_now,  enc_left_prev);
     int16_t right_diff = diff16(right_now, enc_right_prev);
+
     enc_left_prev  = left_now;
     enc_right_prev = right_now;
+
     rpm_left  = -((float)left_diff  / PULSE_PER_REV) * (60000.0f / PID_INTERVAL_MS);
     rpm_right = -((float)right_diff / PULSE_PER_REV) * (60000.0f / PID_INTERVAL_MS);
 }
@@ -171,34 +196,37 @@ void Motor_SetPWM_LR(uint16_t left, uint16_t right)
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, right);
 }
 
-// ★ PID 켜기 - 직진 시 target_rpm으로 속도 제어
 void Motor_Forward(void)
 {
+    if (current_dir != DIR_FORWARD) {
+        pid_enable  = 0;
+        PID_Reset(&pid_left);
+        PID_Reset(&pid_right);
+        current_dir = DIR_FORWARD;
+    }
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
-    if (current_dir != DIR_FORWARD) {
-        current_dir = DIR_FORWARD;
-        PID_Reset(&pid_left);
-        PID_Reset(&pid_right);
-        pid_enable = 1;
-    }
+    Motor_SetPWM_LR(250, 250);
+    pid_enable = 1;
 }
 
+// ★ 후진 PID 추가 (기존: PWM 800 고정 / 변경: target_rpm PID 추종)
 void Motor_Backward(void)
 {
     if (current_dir != DIR_BACKWARD) {
-        current_dir = DIR_BACKWARD;
         pid_enable  = 0;
-        PID_Reset(&pid_left);
+        PID_Reset(&pid_left);   // ★ 적분 초기화
         PID_Reset(&pid_right);
+        current_dir = DIR_BACKWARD;
     }
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);
-    Motor_SetPWM_LR(320, 320);
+    Motor_SetPWM_LR(250, 250);  // ★ PID 시작 초기값
+    pid_enable = 1;              // ★ PID 활성화
 }
 
 void Motor_Stop(void)
@@ -211,15 +239,17 @@ void Motor_Stop(void)
     PID_Reset(&pid_right);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
-    HAL_GPIO_WritePin(GPIOC,
-        GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);
     enc_left_prev  = (int16_t)__HAL_TIM_GET_COUNTER(&htim5);
     enc_right_prev = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
     rpm_left  = 0.0f;
     rpm_right = 0.0f;
 }
 
-// ★ 좌회전: 오른쪽 전진 900, 왼쪽 후진 600
+// ★ 좌회전: 왼쪽 후진 600 / 오른쪽 전진 900 → 제자리 좌회전
 void Motor_Left(void)
 {
     if (current_dir != DIR_LEFT) {
@@ -232,10 +262,10 @@ void Motor_Left(void)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);   // 오른쪽 전진
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
-    Motor_SetPWM_LR(PWM_TURN_SLOW, PWM_TURN); // 왼쪽 후진 600, 오른쪽 전진 900
+    Motor_SetPWM_LR(PWM_TURN_SLOW, PWM_TURN);
 }
 
-// ★ 우회전: 왼쪽 전진 900, 오른쪽 후진 600
+// ★ 우회전: 왼쪽 전진 900 / 오른쪽 후진 600 → 제자리 우회전
 void Motor_Right(void)
 {
     if (current_dir != DIR_RIGHT) {
@@ -248,10 +278,10 @@ void Motor_Right(void)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET); // 오른쪽 후진
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);
-    Motor_SetPWM_LR(PWM_TURN, PWM_TURN_SLOW); // 왼쪽 전진 900, 오른쪽 후진 600
+    Motor_SetPWM_LR(PWM_TURN, PWM_TURN_SLOW);
 }
 
-// ★ U턴: 왼쪽 후진 900, 오른쪽 전진 900
+// ★ 유턴: 왼쪽 후진 / 오른쪽 전진 500/500
 void Motor_UTurn(void)
 {
     if (current_dir != DIR_UTURN) {
@@ -264,7 +294,7 @@ void Motor_UTurn(void)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);   // 오른쪽 전진
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
-    Motor_SetPWM_LR(PWM_TURN, PWM_TURN);
+    Motor_SetPWM_LR(999, 999);
 }
 
 void UART_Print(const char *msg)
@@ -285,11 +315,13 @@ void CAN_Config(void)
     filter.FilterFIFOAssignment = CAN_RX_FIFO0;
     filter.FilterActivation     = ENABLE;
     filter.SlaveStartFilterBank = 14;
+
     if (HAL_CAN_ConfigFilter(&hcan1, &filter) != HAL_OK) Error_Handler();
     if (HAL_CAN_Start(&hcan1) != HAL_OK)                 Error_Handler();
     if (HAL_CAN_ActivateNotification(&hcan1,
             CAN_IT_RX_FIFO0_MSG_PENDING |
             CAN_IT_ERROR | CAN_IT_BUSOFF) != HAL_OK)     Error_Handler();
+
     UART_Print("[CAN] Init OK\r\n");
 }
 
@@ -299,6 +331,7 @@ void CAN_TX_Speed(void)
     int16_t  r100 = (int16_t)(rpm_right * 100.0f);
     uint16_t ccrL = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_1);
     uint16_t ccrR = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_3);
+
     can_tx_data[0] = (uint8_t)((l100 >> 8) & 0xFF);
     can_tx_data[1] = (uint8_t)( l100       & 0xFF);
     can_tx_data[2] = (uint8_t)((r100 >> 8) & 0xFF);
@@ -307,24 +340,28 @@ void CAN_TX_Speed(void)
     can_tx_data[5] = (uint8_t)( ccrL       & 0xFF);
     can_tx_data[6] = (uint8_t)((ccrR >> 8) & 0xFF);
     can_tx_data[7] = (uint8_t)( ccrR       & 0xFF);
+
     can_tx_header.StdId              = CAN_ID_SPEED;
     can_tx_header.ExtId              = 0;
     can_tx_header.RTR                = CAN_RTR_DATA;
     can_tx_header.IDE                = CAN_ID_STD;
     can_tx_header.DLC                = 8;
     can_tx_header.TransmitGlobalTime = DISABLE;
+
     HAL_CAN_AddTxMessage(&hcan1, &can_tx_header, can_tx_data, &can_tx_mailbox);
 }
 
 void CAN_TX_Heartbeat(void)
 {
     can_tx_data[0] = 0xAA;
+
     can_tx_header.StdId              = CAN_ID_HEARTBEAT;
     can_tx_header.ExtId              = 0;
     can_tx_header.RTR                = CAN_RTR_DATA;
     can_tx_header.IDE                = CAN_ID_STD;
     can_tx_header.DLC                = 1;
     can_tx_header.TransmitGlobalTime = DISABLE;
+
     HAL_CAN_AddTxMessage(&hcan1, &can_tx_header, can_tx_data, &can_tx_mailbox);
 }
 
@@ -340,9 +377,11 @@ void CAN_RX_Process(void)
 
     if (id == CAN_ID_CMD) {
         can_timeout_cnt = 0;
+
         uint8_t  dir     = can_rx_data[0];
         uint16_t rpm_x10 = ((uint16_t)can_rx_data[1] << 8) | can_rx_data[2];
         float    new_rpm = rpm_x10 / 10.0f;
+
         if (new_rpm < TARGET_RPM_MIN) new_rpm = TARGET_RPM_MIN;
         if (new_rpm > TARGET_RPM_MAX) new_rpm = TARGET_RPM_MAX;
         if (new_rpm > 0.0f) target_rpm = new_rpm;
@@ -350,22 +389,19 @@ void CAN_RX_Process(void)
         switch (dir) {
             case DIR_FORWARD:
                 Motor_Forward();
-                snprintf(uart_buf, sizeof(uart_buf),
-                         "[CAN] FWD PID:%d TGT:%.1f\r\n", pid_enable, target_rpm);
+                snprintf(uart_buf, sizeof(uart_buf), "[CAN] FWD RPM:%.1f\r\n", target_rpm);
                 break;
             case DIR_BACKWARD:
                 Motor_Backward();
-                snprintf(uart_buf, sizeof(uart_buf), "[CAN] BWD\r\n");
+                snprintf(uart_buf, sizeof(uart_buf), "[CAN] BWD RPM:%.1f\r\n", target_rpm);
                 break;
             case DIR_LEFT:
                 Motor_Left();
-                snprintf(uart_buf, sizeof(uart_buf),
-                         "[CAN] LEFT L:%d R:%d\r\n", PWM_TURN_SLOW, PWM_TURN);
+                snprintf(uart_buf, sizeof(uart_buf), "[CAN] LEFT\r\n");
                 break;
             case DIR_RIGHT:
                 Motor_Right();
-                snprintf(uart_buf, sizeof(uart_buf),
-                         "[CAN] RIGHT L:%d R:%d\r\n", PWM_TURN, PWM_TURN_SLOW);
+                snprintf(uart_buf, sizeof(uart_buf), "[CAN] RIGHT\r\n");
                 break;
             case DIR_UTURN:
                 Motor_UTurn();
@@ -417,18 +453,19 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 int main(void)
 {
-  HAL_Init();
-  SystemClock_Config();
-  MX_GPIO_Init();
-  MX_CAN1_Init();
-  MX_I2C2_Init();
-  MX_TIM2_Init();
-  MX_TIM3_Init();
-  MX_TIM5_Init();
-  MX_TIM6_Init();
-  MX_USART1_UART_Init();
+    HAL_Init();
+    SystemClock_Config();
 
-  /* USER CODE BEGIN 2 */
+    MX_GPIO_Init();
+    MX_CAN1_Init();
+    MX_I2C2_Init();
+    MX_TIM2_Init();
+    MX_TIM3_Init();
+    MX_TIM5_Init();
+    MX_TIM6_Init();
+    MX_USART1_UART_Init();
+
+    /* USER CODE BEGIN 2 */
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
     HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
@@ -442,21 +479,21 @@ int main(void)
     CAN_Config();
     HAL_UART_Receive_IT(&huart1, &rx_data, 1);
 
-    UART_Print("\r\n=== CAN Motor Control + PID ===\r\n");
-    snprintf(uart_buf, sizeof(uart_buf),
-             "FWD PWM:%d  TURN PWM:%d/%d  TGT RPM:%.1f  KP:%.2f KI:%.2f\r\n",
-             PWM_FORWARD, PWM_TURN, PWM_TURN_SLOW, TARGET_RPM_DEFAULT, KP, KI);
+    UART_Print("\r\n=== CAN + PID Motor Control ===\r\n");
+    snprintf(uart_buf, sizeof(uart_buf), "Default RPM: %.1f\r\n", target_rpm);
     UART_Print(uart_buf);
     UART_Print("Ready.\r\n");
-  /* USER CODE END 2 */
+    /* USER CODE END 2 */
 
     while (1)
     {
+        /* USER CODE BEGIN WHILE */
         if (can_rx_flag) {
             can_rx_flag = 0;
             CAN_RX_Process();
         }
 
+        // CAN 타임아웃 (5000ms 동안 0x010 미수신 시 정지)
         if (can_timeout_cnt >= (CAN_CMD_TIMEOUT_MS / PID_INTERVAL_MS)) {
             if (current_dir != DIR_STOP) {
                 Motor_Stop();
@@ -471,10 +508,12 @@ int main(void)
             if (pid_enable) {
                 float out_left  = PID_Compute(&pid_left,  target_rpm, fabsf(rpm_left));
                 float out_right = PID_Compute(&pid_right, target_rpm, fabsf(rpm_right));
+
                 if (out_left  < PWM_MIN) out_left  = PWM_MIN;
                 if (out_left  > PWM_MAX) out_left  = PWM_MAX;
                 if (out_right < PWM_MIN) out_right = PWM_MIN;
                 if (out_right > PWM_MAX) out_right = PWM_MAX;
+
                 pwm_out_left  = (uint16_t)out_left;
                 pwm_out_right = (uint16_t)out_right;
                 Motor_SetPWM_LR(pwm_out_left, pwm_out_right);
@@ -492,50 +531,57 @@ int main(void)
                 CAN_TX_Heartbeat();
             }
 
-            static uint16_t print_cnt = 0;
-            if (++print_cnt >= 100) {
+            static uint8_t print_cnt = 0;
+            if (++print_cnt >= 10) {
                 print_cnt = 0;
                 uint16_t ccrL = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_1);
                 uint16_t ccrR = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_3);
                 snprintf(uart_buf, sizeof(uart_buf),
-                         "DIR:%d PID:%d | L:%.1f RPM PWM:%u | R:%.1f RPM PWM:%u | TGT:%.1f\r\n",
-                         current_dir, pid_enable,
-                         rpm_left, ccrL, rpm_right, ccrR, target_rpm);
+                         "TGT:%.1f | L:%6.1f RPM PWM:%3u | R:%6.1f RPM PWM:%3u\r\n",
+                         target_rpm, rpm_left, ccrL, rpm_right, ccrR);
                 UART_Print(uart_buf);
             }
         }
+
+        HAL_Delay(1);
+        /* USER CODE END WHILE */
     }
 }
 
 void SystemClock_Config(void)
 {
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK) Error_Handler();
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 10;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
-  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) Error_Handler();
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+        Error_Handler();
+
+    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM            = 1;
+    RCC_OscInitStruct.PLL.PLLN            = 10;
+    RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV7;
+    RCC_OscInitStruct.PLL.PLLQ            = RCC_PLLQ_DIV2;
+    RCC_OscInitStruct.PLL.PLLR            = RCC_PLLR_DIV2;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+        Error_Handler();
 }
 
 void Error_Handler(void)
 {
-  __disable_irq();
-  while (1) {}
+    __disable_irq();
+    while (1) {}
 }
 
 #ifdef USE_FULL_ASSERT

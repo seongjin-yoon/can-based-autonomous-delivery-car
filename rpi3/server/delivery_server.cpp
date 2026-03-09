@@ -117,41 +117,74 @@ protected:
 
         std::cout << "\n[📨 메시지 수신]" << std::endl;
         std::cout << "  토픽: [" << topic << "]" << std::endl;
-        std::cout << "  페이로드 크기: " << msg->payloadlen << " bytes" << std::endl;
 
         try {
             auto data = json::parse(payload);
-            std::cout << "  JSON 파싱: 성공" << std::endl;
 
             if (topic.find("delivery/order/") != std::string::npos) {
-                // ✅ ACK 응답 토픽(3to4)은 처리하지 않음 (무한 루프 방지)
+                // ACK 응답 무시
                 if (topic.find("/3to4") != std::string::npos) {
-                    std::cout << "  토픽 매칭: ACK 응답 (무시됨)" << std::endl;
+                    std::cout << "  → ACK 응답 (무시)" << std::endl;
+                    return;
                 }
-                else {
-                    std::cout << "  토픽 매칭: 성공 (delivery/order/)" << std::endl;
-                    handle_order(data);
+
+                std::cout << "  → Order 메시지" << std::endl;
+                
+                // ✅ [FIX] 토픽에서 직접 목적지 추출 (JSON 무시)
+                // 토픽 형식: delivery/order/{order_id}/{destination}
+                // 예: delivery/order/Order_1/A
+                
+                std::string destination = "";
+                
+                // "delivery/order/" 다음 위치
+                size_t pos = topic.find("delivery/order/");
+                if (pos != std::string::npos) {
+                    pos += strlen("delivery/order/");
+                    
+                    // order_id 다음 "/" 찾기
+                    size_t slash = topic.find("/", pos);
+                    if (slash != std::string::npos) {
+                        // "/" 다음부터 끝까지 (또는 다음 "/"까지)
+                        size_t next_slash = topic.find("/", slash + 1);
+                        if (next_slash == std::string::npos) {
+                            destination = topic.substr(slash + 1);
+                        } else {
+                            destination = topic.substr(slash + 1, next_slash - slash - 1);
+                        }
+                        
+                        // 첫 글자만 (A, B, C, D)
+                        if (!destination.empty()) {
+                            destination = destination.substr(0, 1);
+                        }
+                    }
                 }
+                
+                std::cout << "  ✅ 토픽에서 추출한 목적지: '" << destination << "'" << std::endl;
+                
+                // ✅ JSON의 destination을 토픽 값으로 강제 설정
+                if (!destination.empty()) {
+                    data["destination"] = destination;
+                    std::cout << "  ✅ JSON 업데이트: destination = '" << destination << "'" << std::endl;
+                }
+                
+                handle_order(data);
             }
             else if (topic.find("delivery/vehicle/") != std::string::npos) {
-                std::cout << "  토픽 매칭: 성공 (delivery/vehicle/)" << std::endl;
+                std::cout << "  → Vehicle 메시지" << std::endl;
 
-                // ✅ Heartbeat 메시지 확인
                 if (data.contains("heartbeat") && data["heartbeat"] == true) {
                     handle_heartbeat(data);
-                }
-                else {
+                } else {
                     handle_vehicle(data);
                 }
-            }
-            else {
-                std::cout << "  토픽 매칭: 실패 (매칭되는 패턴 없음)" << std::endl;
             }
         }
         catch (const std::exception& e) {
             std::cerr << "✗ JSON 파싱 오류: " << e.what() << std::endl;
         }
     }
+
+    // ✅ 토픽 파싱은 on_message에서 직접 처리 (더 간단함)
 
     void on_disconnect(int rc) override {
         connected = false;
@@ -207,7 +240,11 @@ private:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 order_id TEXT NOT NULL,
-                destination TEXT NOT NULL
+                destination TEXT NOT NULL,
+                pin TEXT NOT NULL,
+                menus TEXT,
+                vehicle_id TEXT,
+                status TEXT DEFAULT 'pending'
             );
 
             CREATE TABLE IF NOT EXISTS heartbeat_table (
@@ -222,6 +259,7 @@ private:
             CREATE INDEX IF NOT EXISTS idx_order_id ON order_table(order_id);
             CREATE INDEX IF NOT EXISTS idx_order_ts ON order_table(timestamp);
             CREATE INDEX IF NOT EXISTS idx_order_dest ON order_table(destination);
+            CREATE INDEX IF NOT EXISTS idx_order_status ON order_table(status);
             CREATE INDEX IF NOT EXISTS idx_heartbeat_vehicle_id ON heartbeat_table(vehicle_id);
             CREATE INDEX IF NOT EXISTS idx_heartbeat_ts ON heartbeat_table(timestamp);
         )";
@@ -231,119 +269,117 @@ private:
         if (rc != SQLITE_OK) {
             std::cerr << "✗ 테이블 생성 실패: " << err << std::endl;
             sqlite3_free(err);
-            sqlite3_close(db);
-            db = nullptr;
             return false;
         }
 
-        std::cout << "  ✓ 테이블 생성됨 (또는 이미 존재함)" << std::endl;
+        std::cout << "  ✓ 테이블 생성 완료" << std::endl;
         return true;
     }
 
-    // MQTT 토픽에 메시지 발행
-    void publish_message(const std::string& topic, const json& data, int qos) {
-        if (!connected) {
-            std::cerr << "⚠️  MQTT 브로커에 연결되지 않음" << std::endl;
-            return;
-        }
-
-        std::string payload = data.dump();
-        int ret = publish(nullptr, topic.c_str(), payload.length(),
-            (const void*)payload.c_str(), qos, false);
-        if (ret != MOSQ_ERR_SUCCESS) {
-            std::cerr << "✗ 메시지 발행 실패 (토픽: " << topic << ")" << std::endl;
-        }
-        else {
-            std::cout << "  ✓ 메시지 발행됨 (토픽: " << topic << ")" << std::endl;
-        }
-    }
-
-    // 매개변수화 쿼리 실행 (SQL Injection 방지)
+    // Prepared Statement를 사용한 쿼리 실행
     bool execute_prepared_query(const std::string& query,
         const std::vector<std::string>& params) {
         if (!db) {
-            std::cerr << "✗ 데이터베이스 초기화되지 않음" << std::endl;
+            std::cerr << "✗ 데이터베이스가 초기화되지 않음" << std::endl;
             return false;
         }
 
         sqlite3_stmt* stmt = nullptr;
-
         int rc = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+
         if (rc != SQLITE_OK) {
             std::cerr << "✗ Prepare 실패: " << sqlite3_errmsg(db) << std::endl;
             return false;
         }
 
-        for (size_t i = 0; i < params.size(); i++) {
+        // 파라미터 바인딩
+        for (size_t i = 0; i < params.size(); ++i) {
             sqlite3_bind_text(stmt, i + 1, params[i].c_str(), -1, SQLITE_STATIC);
         }
 
+        // 쿼리 실행
         rc = sqlite3_step(stmt);
-        if (rc != SQLITE_DONE) {
-            std::cerr << "✗ 실행 실패: " << sqlite3_errmsg(db) << std::endl;
-            sqlite3_finalize(stmt);
-            return false;
-        }
-
         sqlite3_finalize(stmt);
-        return true;
+
+        return (rc == SQLITE_DONE);
     }
 
-    // 원본 SQL 쿼리 실행
-    bool execute_query(const std::string& query) {
-        char* err = nullptr;
-        if (sqlite3_exec(db, query.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
-            std::cerr << "  ✗ DB 오류: " << err << std::endl;
-            sqlite3_free(err);
-            return false;
-        }
-        return true;
-    }
-
-    // ✅ RPi4에서 주문 정보 수신 및 RPi1로 destination 정보 전달
+    // 주문 메시지 처리 (RPi4에서 수신)
     void handle_order(const json& data) {
         try {
-            // order_id 추출 및 검증
+            // 필수 필드 추출
             std::string order_id = data.at("order_id").get<std::string>();
-            std::cout << "✓ 주문 수신됨: " << order_id << std::endl;
-
-            // destination 추출 및 검증 (문자열: A, B, C, D)
             std::string destination = data.at("destination").get<std::string>();
-            std::cout << "✓ 목적지: " << destination << std::endl;
+            std::string pin = data.at("pin").get<std::string>();
+            std::string vehicle_id = data.value("vehicle_id", "vehicle_001");
 
-            // 데이터베이스에 주문 레코드 저장 (destination 포함)
-            std::string insert_query =
-                "INSERT INTO order_table (order_id, destination) VALUES (?, ?)";
-
-            if (!execute_prepared_query(insert_query, { order_id, destination })) {
-                throw std::runtime_error("주문 레코드 삽입 실패");
+            // ✅ PIN 검증 (4자리 확인)
+            if (pin.empty() || pin.length() != 4) {
+                throw std::runtime_error("PIN 형식 오류: 4자리여야 합니다 (입력값: " + pin + ")");
             }
-            std::cout << "  ✓ 주문 레코드가 데이터베이스에 저장됨" << std::endl;
 
-            // ✅ [NEW] RPi1로 destination 정보 전송
-            send_destination_to_vehicle(order_id, destination);
+            std::cout << "✓ 주문 수신 성공" << std::endl;
+            std::cout << "  주문 ID: " << order_id << std::endl;
+            std::cout << "  목적지: " << destination << std::endl;
+            std::cout << "  PIN: " << pin << " (길이: " << pin.length() << " 자리)" << std::endl;
 
-            // RPi4에 확인 응답 전송
+            // 메뉴 배열을 문자열로 변환
+            std::string menus_str;
+            if (data.contains("menus") && data["menus"].is_array()) {
+                auto menus_arr = data["menus"];
+                for (size_t i = 0; i < menus_arr.size(); ++i) {
+                    if (i > 0) menus_str += ", ";
+                    menus_str += menus_arr[i].get<std::string>();
+                }
+            }
+
+            // ✅ 데이터베이스에 주문 정보 저장 (PIN 포함)
+            std::string insert_query =
+                "INSERT INTO order_table (order_id, destination, pin, menus, vehicle_id, status) "
+                "VALUES (?, ?, ?, ?, ?, 'pending')";
+
+            std::cout << "\n📝 데이터베이스 저장 시도:" << std::endl;
+            std::cout << "  쿼리: INSERT INTO order_table" << std::endl;
+            std::cout << "  order_id: " << order_id << std::endl;
+            std::cout << "  destination: " << destination << std::endl;
+            std::cout << "  pin: " << pin << std::endl;
+            std::cout << "  menus: " << menus_str << std::endl;
+            std::cout << "  vehicle_id: " << vehicle_id << std::endl;
+
+            if (!execute_prepared_query(insert_query,
+                { order_id, destination, pin, menus_str, vehicle_id })) {
+                throw std::runtime_error("주문 레코드 삽입 실패 (DB 오류)");
+            }
+
+            std::cout << "✅ 주문이 데이터베이스에 저장됨" << std::endl;
+
+            // ✅ 저장된 데이터 검증 (SELECT로 확인)
+            verify_order_in_database(order_id, pin);
+
+            // ✅ [NEW] 주문 정보(PIN 포함)를 RPi1(배송 로봇)으로 전송
+            send_order_to_vehicle(order_id, destination, pin, menus_str, vehicle_id);
+
+            // ACK 응답 전송
             json ack = {
                 {"order_id", order_id},
-                {"destination", destination},  // 문자열로 저장됨
                 {"timestamp", get_current_timestamp()},
                 {"status", "acknowledged"},
-                {"message", "주문이 수신되어 저장되었습니다"}
+                {"message", "주문이 수락되었습니다"}
             };
 
             std::string ack_topic = "delivery/order/" + order_id + "/3to4";
             publish_message(ack_topic, ack, 1);
 
-            std::cout << "  ✓ 확인 응답이 RPi4로 전송됨" << std::endl;
+            std::cout << "  ✓ ACK 응답 전송 완료" << std::endl;
 
         }
         catch (const std::exception& e) {
             std::cerr << "✗ handle_order 오류: " << e.what() << std::endl;
 
-            // RPi4에 오류 응답 전송
             try {
                 std::string order_id = data.at("order_id").get<std::string>();
+
+                // 에러 응답 전송
                 json error_ack = {
                     {"order_id", order_id},
                     {"timestamp", get_current_timestamp()},
@@ -359,26 +395,83 @@ private:
         }
     }
 
-    // ✅ [NEW] RPi1로 destination 정보 전송 (RPi3 → RPi1)
-    void send_destination_to_vehicle(const std::string& order_id, const std::string& destination) {
+    // ✅ [NEW] 데이터베이스에 저장된 주문 검증 함수
+    void verify_order_in_database(const std::string& order_id, const std::string& expected_pin) {
+        if (!db) {
+            std::cerr << "✗ 데이터베이스 초기화되지 않음" << std::endl;
+            return;
+        }
+
+        sqlite3_stmt* stmt = nullptr;
+        const char* query = "SELECT order_id, destination, pin, menus FROM order_table WHERE order_id = ? LIMIT 1";
+
+        int rc = sqlite3_prepare_v2(db, query, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            std::cerr << "✗ Prepare 실패: " << sqlite3_errmsg(db) << std::endl;
+            return;
+        }
+
+        sqlite3_bind_text(stmt, 1, order_id.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            // 저장된 데이터 추출
+            const char* db_order_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            const char* db_destination = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            const char* db_pin = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            const char* db_menus = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+
+            std::cout << "\n📊 데이터베이스 검증 결과:" << std::endl;
+            std::cout << "  ✓ 주문 ID: " << db_order_id << std::endl;
+            std::cout << "  ✓ 목적지: " << db_destination << std::endl;
+            std::cout << "  ✓ PIN: " << db_pin << " (일치: "
+                << (std::string(db_pin) == expected_pin ? "YES ✅" : "NO ❌") << ")" << std::endl;
+            std::cout << "  ✓ 메뉴: " << db_menus << std::endl;
+
+            if (std::string(db_pin) == expected_pin) {
+                std::cout << "  ✅ PIN 저장 성공!" << std::endl;
+            }
+            else {
+                std::cerr << "  ✗ PIN 불일치 오류!" << std::endl;
+                std::cerr << "    예상: " << expected_pin << " / 저장됨: " << db_pin << std::endl;
+            }
+        }
+        else {
+            std::cerr << "✗ 데이터베이스에서 주문을 찾을 수 없음: " << order_id << std::endl;
+        }
+
+        sqlite3_finalize(stmt);
+    }
+
+    // ✅ [NEW] RPi1으로 주문 정보 전송 (PIN 포함)
+    void send_order_to_vehicle(const std::string& order_id,
+        const std::string& destination,
+        const std::string& pin,
+        const std::string& menus,
+        const std::string& vehicle_id) {
         try {
-            json destination_msg = {
+            // ✅ PIN을 포함한 주문 메시지 구성
+            json order_msg = {
                 {"order_id", order_id},
-                {"vehicle_id", "vehicle_001"},
+                {"vehicle_id", vehicle_id},
                 {"destination", destination},
+                {"pin", pin},
+                {"menus", menus},
                 {"timestamp", get_current_timestamp()},
-                {"message_type", "destination_assignment"}
+                {"message_type", "order_assignment"}
             };
 
-            // RPi1로 destination 정보 전송 (delivery/vehicle/vehicle_001/destination)
-            std::string destination_topic = "delivery/vehicle/vehicle_001/destination";
-            publish_message(destination_topic, destination_msg, 1);
+            // RPi1(배송 로봇)으로 주문 정보 전송
+            // 토픽: delivery/vehicle/{vehicle_id}/order
+            std::string order_topic = "delivery/vehicle/" + vehicle_id + "/order";
+            publish_message(order_topic, order_msg, 1);
 
-            std::cout << "  ✓ Destination 정보가 RPi1로 전송됨 (목적지: " << destination << ")" << std::endl;
+            std::cout << "  ✓ 주문 정보가 RPi1로 전송됨 (주문ID: " << order_id
+                << ", 목적지: " << destination
+                << ", PIN: " << pin << ")" << std::endl;
 
         }
         catch (const std::exception& e) {
-            std::cerr << "✗ send_destination_to_vehicle 오류: " << e.what() << std::endl;
+            std::cerr << "✗ send_order_to_vehicle 오류: " << e.what() << std::endl;
         }
     }
 
@@ -517,13 +610,29 @@ private:
         oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
         return oss.str();
     }
+
+    // MQTT 메시지 발행
+    void publish_message(const std::string& topic, const json& data, int qos) {
+        try {
+            std::string payload = data.dump();
+            int rc = publish(nullptr, topic.c_str(), payload.length(),
+                payload.c_str(), qos, false);
+
+            if (rc != MOSQ_ERR_SUCCESS) {
+                std::cerr << "✗ 메시지 발행 실패 (rc=" << rc << ")" << std::endl;
+            }
+        }
+        catch (const std::exception& e) {
+            std::cerr << "✗ publish_message 오류: " << e.what() << std::endl;
+        }
+    }
 };
 
 
 int main(int argc, char* argv[]) {
     std::cout << "╔════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║  RPi3 배송 서버 (MQTT 통신 + Heartbeat)         ║" << std::endl;
-    std::cout << "║  ✅ 주문 수신 후 RPi1로 Destination 전송       ║" << std::endl;
+    std::cout << "║  RPi3 배송 서버 (MQTT 통신 + PIN 포함)         ║" << std::endl;
+    std::cout << "║  ✅ 주문 수신 후 PIN을 포함하여 RPi1로 전송   ║" << std::endl;
     std::cout << "╚════════════════════════════════════════════════╝" << std::endl;
 
     std::string broker_host = "10.42.0.1";
