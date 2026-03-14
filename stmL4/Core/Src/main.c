@@ -27,11 +27,11 @@
 /* USER CODE BEGIN PD */
 #define PWM_MAX             999
 #define PWM_MIN             0
-#define PWM_DEFAULT         350
-#define PWM_OFFSET          350.0f
+#define PWM_DEFAULT         500
+#define PWM_OFFSET          280.0f
 
-// ★ 회전 PWM 추가
-#define PWM_TURN            999
+// ★ 회전 PWM 추가c
+#define PWM_TURN            950
 #define PWM_TURN_SLOW       800
 
 // 엔코더 (JGB37-520) - 1320 CPR
@@ -208,25 +208,21 @@ void Motor_Forward(void)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
-    Motor_SetPWM_LR(250, 250);
+    Motor_SetPWM_LR(400, 400);
     pid_enable = 1;
 }
 
-// ★ 후진 PID 추가 (기존: PWM 800 고정 / 변경: target_rpm PID 추종)
 void Motor_Backward(void)
 {
     if (current_dir != DIR_BACKWARD) {
         pid_enable  = 0;
-        PID_Reset(&pid_left);   // ★ 적분 초기화
-        PID_Reset(&pid_right);
         current_dir = DIR_BACKWARD;
     }
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);
-    Motor_SetPWM_LR(250, 250);  // ★ PID 시작 초기값
-    pid_enable = 1;              // ★ PID 활성화
+    Motor_SetPWM_LR(800, 800);
 }
 
 void Motor_Stop(void)
@@ -289,12 +285,21 @@ void Motor_UTurn(void)
         pid_enable  = 0;
         PID_Reset(&pid_left);
         PID_Reset(&pid_right);
+
+        // ★ 킥스타트: 500ms 맥스 PWM으로 정지마찰 극복 (A4 매끄러운 표면)
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET); // 왼쪽 후진
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);   // 오른쪽 전진
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
+        Motor_SetPWM_LR(999, 999);
+        HAL_Delay(500);  // 300ms → 500ms
     }
+    // ★ 순항: 매끄러운 바닥이라 높은 PWM 유지
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_RESET); // 왼쪽 후진
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);   // 오른쪽 전진
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_RESET);
-    Motor_SetPWM_LR(999, 999);
+    Motor_SetPWM_LR(999, 999);  // 850 → 950
 }
 
 void UART_Print(const char *msg)
