@@ -19,6 +19,7 @@
 #define DIR_BACKWARD 2
 #define DIR_LEFT     3
 #define DIR_RIGHT    4
+#define DIR_UTURN    5   // ★ 유턴 추가
 #define DEFAULT_RPM  150.0f
 
 static struct termios orig_termios;
@@ -60,10 +61,8 @@ void send_cmd(int sock, uint8_t dir, float rpm)
     frame.data[1] = (rpm_x10 >> 8) & 0xFF;
     frame.data[2] =  rpm_x10       & 0xFF;
 
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-    ssize_t ret = write(sock, &frame, sizeof(frame));
-    if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+    if (write(sock, &frame, sizeof(frame)) < 0 &&
+        errno != EAGAIN && errno != EWOULDBLOCK)
         perror("write");
 }
 
@@ -118,7 +117,7 @@ int main(void)
     { perror("bind"); return 1; }
 
     printf("=== CAN Drive Control (PID) ===\n");
-    printf("1:Left  2:Forward  3:Right  4:Backward  0:Stop\n");
+    printf("1:Left  2:Forward  3:Right  4:Backward  5:UTurn  0:Stop\n");
     printf("+/-: RPM up/down (current: %.1f)\n", target_rpm);
     printf("e: E-Stop  q: Exit\n");
     printf("------------------------------------------\n");
@@ -132,7 +131,6 @@ int main(void)
     {
         recv_feedback(sock);
 
-        // 100ms마다 마지막 명령 재전송
         uint64_t t = now_ms();
         if (t - last_tx_ms >= tx_period_ms) {
             send_cmd(sock, last_dir, last_rpm);
@@ -176,6 +174,13 @@ int main(void)
                     send_cmd(sock, last_dir, last_rpm);
                     last_tx_ms = now_ms();
                     printf("\n[TX] Backward RPM:%.1f\n", target_rpm);
+                    break;
+                case '5':                          // ★ 유턴
+                    last_dir = DIR_UTURN;
+                    last_rpm = target_rpm;
+                    send_cmd(sock, last_dir, last_rpm);
+                    last_tx_ms = now_ms();
+                    printf("\n[TX] UTurn\n");
                     break;
                 case '0':
                     last_dir = DIR_STOP;

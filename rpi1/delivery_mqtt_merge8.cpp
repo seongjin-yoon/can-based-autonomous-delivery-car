@@ -1,13 +1,18 @@
 /*
- * delivery_mqtt.cpp
+ * delivery_mqtt_merge7.cpp
  * 라인트레이싱 + ArUco + MQTT 통합 버전
  *
+ * 변경사항 (merge7):
+ *   1. 좌/우회전: 시간 기반 → 라인 감지 기반 (TURN_MIN_MS 후 라인 보이면 완료)
+ *   2. 라인 재탐색: 정지 500ms → 천천히 follow → S_FOLLOW 복귀 (스무스)
+ *   3. 교차로 인식 불안정 개선: streak 감소 로직 제거 (cool 중엔 유지)
+ *
  * 컴파일:
- *   g++ delivery_mqtt.cpp -o delivery \
+ *   g++ delivery_mqtt_merge7.cpp -o delivery_merge7 \
  *       $(pkg-config --cflags --libs opencv4) \
  *       -lmosquittopp -lpthread
  * 실행:
- *   ./delivery [broker_ip]
+ *   ./delivery_merge7 [broker_ip]
  */
 
 #include <opencv2/opencv.hpp>
@@ -40,16 +45,13 @@
 using json = nlohmann::json;
 
 // ===================== CAN ID 정의 =====================
-// RPi1 → 모터ECU
-#define CAN_MOTOR_CMD     0x010   // 모터 명령 (dir + rpm)
-#define CAN_MOTOR_ESTOP   0x011   // E-Stop
-// RPi1 → 적재함ECU
-#define CAN_CARGO_INFO    0x012   // 배달정보 (PIN + 목적지)
-#define CAN_CARGO_ARRIVE  0x013   // 도착 신호 (0x010과 분리)
-// 적재함ECU → RPi1
-#define CAN_DOOR_STATUS   0x301   // 도어 상태 (0x00=닫힘)
-#define CAN_AUTH_RESULT   0x302   // 인증결과 (0x01=성공, 0x02=오배달/미수령)
-#define CAN_LOCKED        0x303   // 잠금 (0x01) - PIN 5회 실패
+#define CAN_MOTOR_CMD     0x010
+#define CAN_MOTOR_ESTOP   0x011
+#define CAN_CARGO_INFO    0x012
+#define CAN_CARGO_ARRIVE  0x013
+#define CAN_DOOR_STATUS   0x301
+#define CAN_AUTH_RESULT   0x302
+#define CAN_LOCKED        0x303
 
 // ===================== 모터 명령 코드 =====================
 #define DIR_STOP      0
@@ -60,12 +62,13 @@ using json = nlohmann::json;
 #define DIR_UTURN     5
 
 // ===================== 주행 파라미터 =====================
-#define DEFAULT_RPM       100.0f
+#define DEFAULT_RPM       80.0f   // ★ 교차로 인식률 향상을 위해 낮춤 (110→80)
 #define TURN_RPM          150.0f
+#define REACQ_RPM         25.0f    // ★ 재탐색 속도 (천천히)
 #define STRAIGHT_DEADBAND 50
 
 // ===================== 교차로 감지 파라미터 =====================
-#define JUNC_STREAK       2
+#define JUNC_STREAK       1    // ★ 1프레임만 감지돼도 교차로 처리 (빠른 속도 대응)
 #define JUNC_START_DELAY  3000
 #define JUNC_COOLDOWN_MS  3500
 #define HIGH_TH           0.40f
@@ -75,10 +78,15 @@ using json = nlohmann::json;
 // ===================== 상태 지속 시간 =====================
 #define DUR_JUNC_STOP_MS      800
 #define DUR_STRAIGHT_MS       2000
-#define DUR_TURN_MS           3000
-#define DUR_UTURN_MS          9000
-#define DUR_REACQ_MS          500
+#define DUR_TURN_MS           5000   // ★ fallback 최대 회전 시간
+#define DUR_UTURN_MS          7000
+#define DUR_REACQ_MS          3000   // ★ 재탐색 최대 시간
 #define DUR_REACQ_UTURN_MS    1000
+
+// ★ 라인 감지 기반 회전 파라미터
+#define TURN_MIN_MS           400    // 최소 회전 시간 (오인식 방지)
+#define TURN_LINE_ERR_TH      60     // 라인 중앙 판단 err 임계값
+#define TURN_LINE_AREA_MIN    800.0  // 라인 감지 최소 면적
 
 // ===================== 상태머신 =====================
 typedef enum {
@@ -298,7 +306,6 @@ public:
         printf("[MQTT] 배달 완료\n");
     }
 
-    // ★ PIN 5회 실패 잠금 알림 → RPi3 서버
     void send_pin_locked_alert() {
         json msg = {
             {"vehicle_id",  g_vehicle_id},
@@ -308,10 +315,9 @@ public:
             {"timestamp",   get_timestamp()}
         };
         pub("delivery/vehicle/" + g_vehicle_id + "/alert", msg, 1);
-        printf("[MQTT] 잠금 알림 → RPi3 서버 전송\n");
+        printf("[MQTT] 잠금 알림 → RPi3\n");
     }
 
-    // ★ PIN 인증 성공 알림
     void send_pin_success_alert() {
         json msg = {
             {"vehicle_id",  g_vehicle_id},
@@ -321,7 +327,7 @@ public:
             {"timestamp",   get_timestamp()}
         };
         pub("delivery/vehicle/" + g_vehicle_id + "/alert", msg, 1);
-        printf("[MQTT] 인증 성공 알림 → RPi3 서버 전송\n");
+        printf("[MQTT] 인증 성공 알림 → RPi3\n");
     }
 
 protected:
@@ -329,10 +335,9 @@ protected:
         if (rc == 0) {
             connected = true;
             subscribe(nullptr,
-                ("delivery/vehicle/" + g_vehicle_id + "/destination").c_str(), 1);
+                ("delivery/vehicle/" + g_vehicle_id + "/order").c_str(), 1);
             printf("[MQTT] 연결됨\n");
-            printf("[MQTT] 구독: delivery/vehicle/%s/destination\n",
-                   g_vehicle_id.c_str());
+            printf("[MQTT] 구독: delivery/vehicle/%s/order\n", g_vehicle_id.c_str());
         }
     }
 
@@ -346,7 +351,7 @@ protected:
         std::string payload((char*)msg->payload, msg->payloadlen);
         try {
             auto data = json::parse(payload);
-            if (topic.find("/destination") != std::string::npos) {
+            if (topic.find("/order") != std::string::npos) {
                 std::string dest_str = data["destination"].get<std::string>();
                 int dest = (dest_str=="A")?1:(dest_str=="B")?2:
                            (dest_str=="C")?3:4;
@@ -355,7 +360,7 @@ protected:
                 last_dest     = dest;
                 g_destination = dest;
                 g_start_cmd   = true;
-                printf("\n[MQTT] 출동 명령! 목적지=%s PIN=%s order_id=%s\n",
+                printf("\n[MQTT] 출동! 목적지=%s PIN=%s order_id=%s\n",
                        dest_str.c_str(), last_pin.c_str(), g_delivery_id.c_str());
             }
         } catch (...) {
@@ -364,7 +369,7 @@ protected:
     }
 };
 
-// ===================== CAN 수신 (비블로킹) =====================
+// ===================== CAN 수신 =====================
 void recv_can(int sock, VehicleMQTT& mqtt) {
     struct can_frame frame;
     fd_set fds;
@@ -373,23 +378,18 @@ void recv_can(int sock, VehicleMQTT& mqtt) {
     FD_SET(sock, &fds);
     if (select(sock + 1, &fds, NULL, NULL, &tv) > 0) {
         if (read(sock, &frame, sizeof(frame)) > 0) {
-
-            // 0x301=0x00: 도어 닫힘 → 유턴 트리거
             if (frame.can_id == CAN_DOOR_STATUS && frame.data[0] == 0x00) {
                 printf("\n[CAN RX] 0x301=0x00 도어 닫힘 → 유턴!\n");
                 g_door_closed = true;
             }
-            // 0x302=0x01: 인증 성공
             else if (frame.can_id == CAN_AUTH_RESULT && frame.data[0] == 0x01) {
                 printf("\n[CAN RX] 0x302=0x01 인증 성공\n");
                 mqtt.send_pin_success_alert();
             }
-            // 0x302=0x02: 오배달/미수령 → 즉시 유턴
             else if (frame.can_id == CAN_AUTH_RESULT && frame.data[0] == 0x02) {
                 printf("\n[CAN RX] 0x302=0x02 오배달/미수령 → 즉시 유턴\n");
                 g_door_closed = true;
             }
-            // ★ 0x303=0x01: PIN 5회 실패 잠금 → MQTT로 RPi3 서버에 알림
             else if (frame.can_id == CAN_LOCKED && frame.data[0] == 0x01) {
                 printf("\n[CAN RX] 0x303=0x01 PIN 5회 실패 잠금!\n");
                 mqtt.send_pin_locked_alert();
@@ -419,7 +419,9 @@ static int detect_aruco(const cv::Mat& frame) {
 }
 
 // ===================== 라인 추적 =====================
-static uint8_t follow_line(const cv::Mat& frame, int& err_out, cv::Mat& vis) {
+// ★ line_area_out: 감지된 라인 면적 반환 (회전 중 라인 감지 판단용)
+static uint8_t follow_line(const cv::Mat& frame, int& err_out, cv::Mat& vis,
+                            double* line_area_out = nullptr) {
     int H = frame.rows, W = frame.cols;
     int y0 = (int)(H * 0.65);
     cv::Mat roi = frame(cv::Rect(0, y0, W, H - y0));
@@ -439,6 +441,8 @@ static uint8_t follow_line(const cv::Mat& frame, int& err_out, cv::Mat& vis) {
         double a = cv::contourArea(contours[i]);
         if (a > best_area) { best_area = a; best = i; }
     }
+
+    if (line_area_out) *line_area_out = best_area;
 
     if (best < 0 || best_area < 500) { err_out = 0; return DIR_FORWARD; }
 
@@ -482,7 +486,7 @@ int main(int argc, char* argv[]) {
     std::string broker_host = "10.42.0.1";
     if (argc > 1) broker_host = argv[1];
 
-    printf("=== 배달 차량 (라인트레이싱 + MQTT + 적재함ECU) ===\n");
+    printf("=== 배달 차량 v7 (라인감지 회전 + 스무스 재탐색) ===\n");
     printf("목적지: A=1 B=2 C=3 D=4\n");
     printf("키: q=종료 e=E-Stop 1/2/3/4=수동목적지설정\n");
     printf("브로커: %s\n\n", broker_host.c_str());
@@ -548,10 +552,9 @@ int main(int argc, char* argv[]) {
         uint8_t  cmd = DIR_STOP;
         cv::Mat  vis = frame.clone();
 
-        // ── CAN 수신 (매 루프 체크) ──
         recv_can(sock, mqtt);
 
-        // ── 키 입력 ──
+        // 키 입력
         {
             fd_set fds; struct timeval tv = {0, 0};
             FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
@@ -567,7 +570,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // ── 상태머신 ──
         switch (state) {
 
         case S_WAIT_CMD:
@@ -584,7 +586,7 @@ int main(int argc, char* argv[]) {
                 streak        = 0;
                 returning     = false;
                 start_ts      = t;
-                last_junc     = t;
+                last_junc     = 0;   // ★ 첫 번째 교차로 쿨다운 없이 바로 인식
                 state         = S_FOLLOW;
                 state_ts      = t;
                 const char* dn = (dest==1)?"A":(dest==2)?"B":(dest==3)?"C":"D";
@@ -598,9 +600,9 @@ int main(int argc, char* argv[]) {
             int aid = detect_aruco(frame);
 
             if (!returning && dest > 0 && aid == get_target_aruco(dest)) {
-                printf("\n[도착] ArUco ID=%d 감지! 즉시 정지\n", aid);
+                printf("\n[도착] ArUco ID=%d 감지! 정지\n", aid);
                 send_cmd(sock, DIR_STOP, 0);
-                last_tx  = t;
+                last_tx = t;
                 send_cargo_arrival(sock);
                 g_door_closed = false;
                 state    = S_DELIVER_WAIT;
@@ -613,12 +615,13 @@ int main(int argc, char* argv[]) {
             if (returning && aid == 0) {
                 printf("\n[복귀 완료] ArUco ID=0 감지!\n");
                 send_cmd(sock, DIR_STOP, 0);
-                last_tx  = t;
-                state    = S_FINISHED;
+                last_tx = t;
+                state   = S_FINISHED;
                 state_ts = t;
                 break;
             }
 
+            // 교차로 감지
             int H = frame.rows, W = frame.cols;
             int yj0 = (int)(H * 0.40), yj1 = (int)(H * 0.62);
             cv::Mat jroi = frame(cv::Rect(0, yj0, W, yj1 - yj0));
@@ -636,9 +639,10 @@ int main(int argc, char* argv[]) {
             bool start_ok = (t - start_ts) >= JUNC_START_DELAY;
             bool cool     = (t - last_junc) > JUNC_COOLDOWN_MS;
 
-            if (start_ok && cool && jt != J_NONE) streak++;
-            else if (!cool || !start_ok)           streak = 0;
-            else                                   streak = std::max(0, streak - 1);
+            // ★ streak 개선: cool 중에는 streak 유지 (감소 없음)
+            if (start_ok && cool && jt != J_NONE)  streak++;
+            else if (!start_ok)                     streak = 0;
+            // cool 중이면 streak 그대로 유지 (감소 안 함)
 
             cv::rectangle(vis, cv::Point(0, yj0), cv::Point(W, yj1),
                           cv::Scalar(255, 0, 255), 2);
@@ -688,7 +692,7 @@ int main(int argc, char* argv[]) {
                 send_cmd(sock, cmd, tx_rpm);
                 last_tx = t;
             }
-            if ((t - last_tx) >= 200) {
+            {
                 const char* d = (cmd==DIR_FORWARD)?"ST":(cmd==DIR_LEFT)?"L":"R";
                 printf("\r[%s err=%4d] DEST:%d %s JUNC:%d RPM:%.0f",
                        d, err, dest, returning?"RET":"GO", junc_count, g_rpm);
@@ -710,7 +714,7 @@ int main(int argc, char* argv[]) {
                 state_ts = t;
                 const char* an = (g_next_action==DIR_FORWARD)?"직진":
                                  (g_next_action==DIR_LEFT)?"좌회전":"우회전";
-                printf("\n[행동 시작] %s (%dms)\n", an, DUR_TURN_MS);
+                printf("\n[행동 시작] %s\n", an);
             }
             break;
 
@@ -727,43 +731,100 @@ int main(int argc, char* argv[]) {
             }
             break;
 
-        case S_JUNC_LEFT:
+        // ★ 라인 감지 기반 좌회전
+        case S_JUNC_LEFT: {
             cmd = DIR_LEFT;
             if ((t - last_tx) >= 50) {
                 send_cmd(sock, DIR_LEFT, TURN_RPM);
                 last_tx = t;
             }
+            // 최소 회전 시간 이후에만 라인 감지 체크
+            if (dt >= TURN_MIN_MS) {
+                int err = 0;
+                double area = 0;
+                cv::Mat vis_tmp = vis.clone();
+                follow_line(frame, err, vis_tmp, &area);
+                // 라인 면적 충분하고 중앙 근처이면 완료
+                if (area >= TURN_LINE_AREA_MIN && abs(err) < TURN_LINE_ERR_TH) {
+                    printf("\n[좌회전 완료] 라인 감지 err=%d area=%.0f (%.0fms)\n",
+                           err, area, (float)dt);
+                    state    = S_REACQUIRE;
+                    state_ts = t;
+                    break;
+                }
+            }
+            // fallback: 최대 시간 초과
             if (dt >= DUR_TURN_MS) {
+                printf("\n[좌회전 완료] fallback timeout\n");
                 state    = S_REACQUIRE;
                 state_ts = t;
-                printf("\n[좌회전 완료] 라인 재탐색\n");
             }
+            printf("\r[좌회전 중] %.1fs err검사:%s",
+                   dt/1000.0f, dt >= TURN_MIN_MS ? "ON" : "OFF");
+            fflush(stdout);
             break;
+        }
 
-        case S_JUNC_RIGHT:
+        // ★ 라인 감지 기반 우회전
+        case S_JUNC_RIGHT: {
             cmd = DIR_RIGHT;
             if ((t - last_tx) >= 50) {
                 send_cmd(sock, DIR_RIGHT, TURN_RPM);
                 last_tx = t;
             }
+            if (dt >= TURN_MIN_MS) {
+                int err = 0;
+                double area = 0;
+                cv::Mat vis_tmp = vis.clone();
+                follow_line(frame, err, vis_tmp, &area);
+                if (area >= TURN_LINE_AREA_MIN && abs(err) < TURN_LINE_ERR_TH) {
+                    printf("\n[우회전 완료] 라인 감지 err=%d area=%.0f (%.0fms)\n",
+                           err, area, (float)dt);
+                    state    = S_REACQUIRE;
+                    state_ts = t;
+                    break;
+                }
+            }
             if (dt >= DUR_TURN_MS) {
+                printf("\n[우회전 완료] fallback timeout\n");
                 state    = S_REACQUIRE;
                 state_ts = t;
-                printf("\n[우회전 완료] 라인 재탐색\n");
             }
+            printf("\r[우회전 중] %.1fs err검사:%s",
+                   dt/1000.0f, dt >= TURN_MIN_MS ? "ON" : "OFF");
+            fflush(stdout);
             break;
+        }
 
+        // ★ 스무스 재탐색: 정지 없이 바로 천천히 follow_line
         case S_REACQUIRE: {
             int err = 0;
-            cmd = follow_line(frame, err, vis);
-            if ((t - last_tx) >= 50) {
-                send_cmd(sock, cmd, DEFAULT_RPM);
+            double area = 0;
+            cmd = follow_line(frame, err, vis, &area);
+
+            if ((t - last_tx) >= 80) {   // 80ms 간격으로 천천히
+                send_cmd(sock, cmd, REACQ_RPM);
                 last_tx = t;
             }
+
+            printf("\r[재탐색] %.1fs err=%d area=%.0f RPM=%.0f",
+                   dt/1000.0f, err, area, REACQ_RPM);
+            fflush(stdout);
+
+            // ★ 라인을 충분히 찾으면 바로 S_FOLLOW로
+            if (area >= TURN_LINE_AREA_MIN && abs(err) < STRAIGHT_DEADBAND + 20) {
+                start_ts = t;
+                state    = S_FOLLOW;
+                state_ts = t;
+                printf("\n[재탐색 완료] 라인 복귀 err=%d\n", err);
+                break;
+            }
+            // 최대 시간 초과 fallback
             if (dt >= DUR_REACQ_MS) {
                 start_ts = t;
                 state    = S_FOLLOW;
                 state_ts = t;
+                printf("\n[재탐색 완료] fallback timeout\n");
             }
             break;
         }
@@ -850,7 +911,7 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // ── 시각화 ──
+        // 시각화
         const char* stname =
             (state == S_WAIT_CMD)             ? "WAIT"      :
             (state == S_FOLLOW)               ? "FOLLOW"    :

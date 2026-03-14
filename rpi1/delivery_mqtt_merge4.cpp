@@ -39,7 +39,16 @@
 
 using json = nlohmann::json;
 
-// ===================== CAN 명령 코드 =====================
+// ===================== CAN ID 정의 =====================
+#define CAN_MOTOR_CMD     0x010
+#define CAN_MOTOR_ESTOP   0x011
+#define CAN_CARGO_INFO    0x012
+#define CAN_CARGO_ARRIVE  0x013
+#define CAN_DOOR_STATUS   0x301
+#define CAN_AUTH_RESULT   0x302
+#define CAN_LOCKED        0x303
+
+// ===================== 모터 명령 코드 =====================
 #define DIR_STOP      0
 #define DIR_FORWARD   1
 #define DIR_BACKWARD  2
@@ -48,30 +57,25 @@ using json = nlohmann::json;
 #define DIR_UTURN     5
 
 // ===================== 주행 파라미터 =====================
-#define DEFAULT_RPM       80.0f
-#define TURN_RPM          150.0f
+#define DEFAULT_RPM       100.0f
+#define TURN_RPM          350.0f
 #define STRAIGHT_DEADBAND 50
 
 // ===================== 교차로 감지 파라미터 =====================
-// ★ STREAK 낮춤: 3프레임만 연속이면 교차로 인식
-#define JUNC_STREAK       3
-// ★ 출발 후 교차로 무시 시간
-#define JUNC_START_DELAY  4000
+#define JUNC_STREAK       2
+#define JUNC_START_DELAY  3000
 #define JUNC_COOLDOWN_MS  3500
-// ★ 양쪽 모두 높아야 하는 기준 (실제 교차로: L=0.87 M=0.70 R=0.56)
-#define HIGH_TH           0.45f
-// ★ 한쪽만 높을 때 기준 (더 엄격하게)
+#define HIGH_TH           0.40f
 #define HIGH_TH_ONE       0.65f
-// ★ M 기준
 #define MID_TH            0.40f
 
 // ===================== 상태 지속 시간 =====================
-#define DUR_JUNC_STOP_MS  800
-#define DUR_STRAIGHT_MS   600
-#define DUR_TURN_MS       5000
-#define DUR_UTURN_MS      1500
-#define DUR_REACQ_MS      500
-#define DELIVER_WAIT_MS   10000
+#define DUR_JUNC_STOP_MS      1500
+#define DUR_STRAIGHT_MS       2000
+#define DUR_TURN_MS           3000
+#define DUR_UTURN_MS          7000
+#define DUR_REACQ_MS          2000
+#define DUR_REACQ_UTURN_MS    1000
 
 // ===================== 상태머신 =====================
 typedef enum {
@@ -82,6 +86,7 @@ typedef enum {
     S_JUNC_LEFT,
     S_JUNC_RIGHT,
     S_REACQUIRE,
+    S_REACQUIRE_AFTER_UTURN,
     S_DELIVER_WAIT,
     S_UTURN,
     S_FINISHED
@@ -97,6 +102,7 @@ static uint8_t        g_next_action = DIR_FORWARD;
 static std::atomic<int>  g_destination(0);
 static std::atomic<bool> g_start_cmd(false);
 static std::atomic<bool> g_running(true);
+static std::atomic<bool> g_door_closed(false);
 static std::string       g_delivery_id = "";
 static std::string       g_vehicle_id  = "vehicle_001";
 
@@ -163,11 +169,11 @@ void term_raw_on() {
 }
 void term_raw_off() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); }
 
-// ===================== CAN =====================
+// ===================== CAN 송신 =====================
 void send_cmd(int sock, uint8_t dir, float rpm) {
     struct can_frame frame;
     memset(&frame, 0, sizeof(frame));
-    frame.can_id  = 0x010;
+    frame.can_id  = CAN_MOTOR_CMD;
     frame.can_dlc = 3;
     uint16_t rpm_x10 = (uint16_t)(rpm * 10.0f);
     frame.data[0] = dir;
@@ -180,13 +186,220 @@ void send_cmd(int sock, uint8_t dir, float rpm) {
         perror("CAN write");
 }
 
+void send_stop_blocking(int sock) {
+    struct can_frame frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.can_id  = CAN_MOTOR_CMD;
+    frame.can_dlc = 3;
+    frame.data[0] = DIR_STOP;
+    frame.data[1] = 0;
+    frame.data[2] = 0;
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+    write(sock, &frame, sizeof(frame));
+    fcntl(sock, F_SETFL, flags);
+}
+
 void send_estop(int sock) {
     struct can_frame frame;
     memset(&frame, 0, sizeof(frame));
-    frame.can_id  = 0x011;
+    frame.can_id  = CAN_MOTOR_ESTOP;
     frame.can_dlc = 1;
     frame.data[0] = 0xFF;
     write(sock, &frame, sizeof(frame));
+}
+
+void send_cargo_info(int sock, const std::string& pin, int dest) {
+    struct can_frame frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.can_id  = CAN_CARGO_INFO;
+    frame.can_dlc = 6;
+    frame.data[0] = 0x01;
+    for (int i = 0; i < 4; i++)
+        frame.data[1+i] = (pin.size() > (size_t)i) ? (pin[i] - '0') : 0;
+    frame.data[5] = (uint8_t)dest;
+    write(sock, &frame, sizeof(frame));
+    printf("[CAN TX] 0x012 배달정보 PIN=%s DEST=%d\n", pin.c_str(), dest);
+}
+
+void send_cargo_arrival(int sock) {
+    struct can_frame frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.can_id  = CAN_CARGO_ARRIVE;
+    frame.can_dlc = 1;
+    frame.data[0] = 0x01;
+    write(sock, &frame, sizeof(frame));
+    printf("[CAN TX] 0x013 도착 신호 → 적재함ECU\n");
+}
+
+// ===================== MQTT 클라이언트 =====================
+class VehicleMQTT : public mosqpp::mosquittopp {
+public:
+    bool        connected = false;
+    std::string last_pin  = "0000";
+    int         last_dest = 1;
+
+    VehicleMQTT() : mosqpp::mosquittopp("rpi1-vehicle") {
+        username_pw_set("hoji", "1234");
+    }
+
+    bool start(const std::string& host, int port = 1883) {
+        mosqpp::lib_init();
+        int rc = connect(host.c_str(), port, 60);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            fprintf(stderr, "[MQTT] 연결 실패 rc=%d - 오프라인 모드\n", rc);
+            return false;
+        }
+        loop_start();
+        for (int i = 0; i < 50 && !connected; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        return connected;
+    }
+
+    void pub(const std::string& topic, const json& data, int qos = 1) {
+        if (!connected) return;
+        std::string payload = data.dump();
+        publish(nullptr, topic.c_str(), payload.size(), payload.c_str(), qos, false);
+    }
+
+    void send_status(const std::string& status) {
+        json msg = {
+            {"vehicle_id",  g_vehicle_id},
+            {"order_id",    g_delivery_id},
+            {"status",      status},
+            {"timestamp",   get_timestamp()}
+        };
+        pub("delivery/vehicle/" + g_vehicle_id + "/status", msg, 0);
+    }
+
+    void send_start(int dest) {
+        const char* dn = (dest==1)?"A":(dest==2)?"B":(dest==3)?"C":"D";
+        json msg = {
+            {"vehicle_id",  g_vehicle_id},
+            {"order_id",    g_delivery_id},
+            {"destination", std::string(dn)},
+            {"status",      "in_transit"},
+            {"timestamp",   get_timestamp()}
+        };
+        pub("delivery/vehicle/" + g_vehicle_id + "/1to3", msg, 1);
+        printf("[MQTT] 출발 → 목적지 %s\n", dn);
+    }
+
+    void send_arrived(int dest) {
+        const char* dn = (dest==1)?"A":(dest==2)?"B":(dest==3)?"C":"D";
+        json msg = {
+            {"vehicle_id",  g_vehicle_id},
+            {"order_id",    g_delivery_id},
+            {"destination", std::string(dn)},
+            {"status",      "arrived"},
+            {"timestamp",   get_timestamp()}
+        };
+        pub("delivery/vehicle/" + g_vehicle_id + "/1to3", msg, 1);
+        printf("[MQTT] 도착! 목적지 %s\n", dn);
+    }
+
+    void send_complete() {
+        json msg = {
+            {"vehicle_id",  g_vehicle_id},
+            {"order_id",    g_delivery_id},
+            {"status",      "completed"},
+            {"timestamp",   get_timestamp()}
+        };
+        pub("delivery/vehicle/" + g_vehicle_id + "/1to3", msg, 1);
+        printf("[MQTT] 배달 완료\n");
+    }
+
+    void send_pin_locked_alert() {
+        json msg = {
+            {"vehicle_id",  g_vehicle_id},
+            {"order_id",    g_delivery_id},
+            {"event",       "pin_locked"},
+            {"message",     "PIN 5회 실패 - 적재함 잠금 (10초)"},
+            {"timestamp",   get_timestamp()}
+        };
+        pub("delivery/vehicle/" + g_vehicle_id + "/alert", msg, 1);
+        printf("[MQTT] 잠금 알림 → RPi3 서버 전송\n");
+    }
+
+    void send_pin_success_alert() {
+        json msg = {
+            {"vehicle_id",  g_vehicle_id},
+            {"order_id",    g_delivery_id},
+            {"event",       "pin_success"},
+            {"message",     "PIN 인증 성공 - 도어 열림"},
+            {"timestamp",   get_timestamp()}
+        };
+        pub("delivery/vehicle/" + g_vehicle_id + "/alert", msg, 1);
+        printf("[MQTT] 인증 성공 알림 → RPi3 서버 전송\n");
+    }
+
+protected:
+    void on_connect(int rc) override {
+        if (rc == 0) {
+            connected = true;
+            subscribe(nullptr,
+                ("delivery/vehicle/" + g_vehicle_id + "/order").c_str(), 1);
+            printf("[MQTT] 연결됨\n");
+            printf("[MQTT] 구독: delivery/vehicle/%s/order\n",
+                   g_vehicle_id.c_str());
+        }
+    }
+
+    void on_disconnect(int rc) override {
+        connected = false;
+        printf("[MQTT] 연결 끊김 rc=%d\n", rc);
+    }
+
+    void on_message(const struct mosquitto_message* msg) override {
+        std::string topic(msg->topic);
+        std::string payload((char*)msg->payload, msg->payloadlen);
+        try {
+            auto data = json::parse(payload);
+            if (topic.find("/order") != std::string::npos) {
+                std::string dest_str = data["destination"].get<std::string>();
+                int dest = (dest_str=="A")?1:(dest_str=="B")?2:
+                           (dest_str=="C")?3:4;
+                g_delivery_id = data.value("order_id", "");
+                last_pin      = data.value("pin", "0000");
+                last_dest     = dest;
+                g_destination = dest;
+                g_start_cmd   = true;
+                printf("\n[MQTT] 출동 명령! 목적지=%s PIN=%s order_id=%s\n",
+                       dest_str.c_str(), last_pin.c_str(), g_delivery_id.c_str());
+            }
+        } catch (...) {
+            printf("[MQTT] JSON 파싱 오류\n");
+        }
+    }
+};
+
+// ===================== CAN 수신 (비블로킹) =====================
+void recv_can(int sock, VehicleMQTT& mqtt) {
+    struct can_frame frame;
+    fd_set fds;
+    struct timeval tv = {0, 0};
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    if (select(sock + 1, &fds, NULL, NULL, &tv) > 0) {
+        if (read(sock, &frame, sizeof(frame)) > 0) {
+            if (frame.can_id == CAN_DOOR_STATUS && frame.data[0] == 0x00) {
+                printf("\n[CAN RX] 0x301=0x00 도어 닫힘 → 유턴!\n");
+                g_door_closed = true;
+            }
+            else if (frame.can_id == CAN_AUTH_RESULT && frame.data[0] == 0x01) {
+                printf("\n[CAN RX] 0x302=0x01 인증 성공\n");
+                mqtt.send_pin_success_alert();
+            }
+            else if (frame.can_id == CAN_AUTH_RESULT && frame.data[0] == 0x02) {
+                printf("\n[CAN RX] 0x302=0x02 오배달/미수령 → 즉시 유턴\n");
+                g_door_closed = true;
+            }
+            else if (frame.can_id == CAN_LOCKED && frame.data[0] == 0x01) {
+                printf("\n[CAN RX] 0x303=0x01 PIN 5회 실패 잠금!\n");
+                mqtt.send_pin_locked_alert();
+            }
+        }
+    }
 }
 
 // ===================== ArUco 감지 =====================
@@ -246,12 +459,6 @@ static uint8_t follow_line(const cv::Mat& frame, int& err_out, cv::Mat& vis) {
 }
 
 // ===================== 교차로 감지 =====================
-// ★ 핵심 수정
-// 실제 교차로값: L=0.87 M=0.70 R=0.56
-// 직선값 예시:  L=0.00 M=0.44 R=0.99  (오인식 케이스)
-//              L=0.09 M=0.46 R=0.97  (오인식 케이스)
-// → 직선: 한쪽만 매우 높고 반대쪽은 거의 0
-// → 교차로: 양쪽 모두 어느정도 높음
 static JuncType classify_junction(const cv::Mat& bin_roi,
                                    float& dbg_L, float& dbg_M, float& dbg_R)
 {
@@ -262,17 +469,10 @@ static JuncType classify_junction(const cv::Mat& bin_roi,
     dbg_M = (float)cv::countNonZero(bin_roi(cv::Rect(lw,    0, mw, h))) / (float)(mw * h);
     dbg_R = (float)cv::countNonZero(bin_roi(cv::Rect(lw+mw, 0, rw, h))) / (float)(rw * h);
 
-    // 십자: L, M, R 모두 HIGH_TH 이상
     if (dbg_L >= HIGH_TH && dbg_M >= HIGH_TH && dbg_R >= HIGH_TH)
         return J_PLUS;
-
-    // T자: L과 R 둘 다 HIGH_TH 이상
     if (dbg_L >= HIGH_TH && dbg_R >= HIGH_TH)
         return J_T;
-
-    // ★ 한쪽만 높을 때: HIGH_TH_ONE(0.65) 이상 + 반대쪽도 최소 0.30 이상
-    // 직선은 반대쪽이 0.00~0.09 → 걸리지 않음
-    // 교차로는 반대쪽도 0.45~0.56 → 걸림
     if (dbg_R >= HIGH_TH_ONE && dbg_L >= 0.30f && dbg_M >= MID_TH)
         return J_T;
     if (dbg_L >= HIGH_TH_ONE && dbg_R >= 0.30f && dbg_M >= MID_TH)
@@ -281,126 +481,12 @@ static JuncType classify_junction(const cv::Mat& bin_roi,
     return J_NONE;
 }
 
-// ===================== MQTT 클라이언트 =====================
-class VehicleMQTT : public mosqpp::mosquittopp {
-public:
-    bool connected = false;
-
-    VehicleMQTT() : mosqpp::mosquittopp("rpi1-vehicle") {
-        username_pw_set("hoji", "1234");
-    }
-
-    bool start(const std::string& host, int port = 1883) {
-        mosqpp::lib_init();
-        int rc = connect(host.c_str(), port, 60);
-        if (rc != MOSQ_ERR_SUCCESS) {
-            fprintf(stderr, "[MQTT] 연결 실패 rc=%d - 오프라인 모드\n", rc);
-            return false;
-        }
-        loop_start();
-        for (int i = 0; i < 50 && !connected; i++)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        return connected;
-    }
-
-    void pub(const std::string& topic, const json& data, int qos = 1) {
-        if (!connected) return;
-        std::string payload = data.dump();
-        publish(nullptr, topic.c_str(), payload.size(), payload.c_str(), qos, false);
-    }
-
-    void send_status(const std::string& status) {
-        json msg = {
-            {"vehicle_id",  g_vehicle_id},
-            {"delivery_id", g_delivery_id},
-            {"status",      status},
-            {"timestamp",   get_timestamp()}
-        };
-        pub("delivery/vehicle/" + g_vehicle_id + "/status", msg, 0);
-    }
-
-    void send_start(int dest) {
-        const char* dn = (dest==1)?"A":(dest==2)?"B":(dest==3)?"C":"D";
-        json msg = {
-            {"vehicle_id",  g_vehicle_id},
-            {"delivery_id", g_delivery_id},
-            {"destination", std::string(dn)},
-            {"status",      "in_transit"},
-            {"timestamp",   get_timestamp()}
-        };
-        pub("delivery/start/" + g_vehicle_id + "/1to3", msg, 1);
-        printf("[MQTT] 출발 → 목적지 %s\n", dn);
-    }
-
-    void send_arrived(int dest) {
-        const char* dn = (dest==1)?"A":(dest==2)?"B":(dest==3)?"C":"D";
-        json msg = {
-            {"vehicle_id",  g_vehicle_id},
-            {"delivery_id", g_delivery_id},
-            {"destination", std::string(dn)},
-            {"status",      "arrived"},
-            {"timestamp",   get_timestamp()}
-        };
-        pub("delivery/arrived/" + g_vehicle_id + "/1to3", msg, 1);
-        printf("[MQTT] 도착! 목적지 %s\n", dn);
-    }
-
-    void send_complete() {
-        json msg = {
-            {"vehicle_id",  g_vehicle_id},
-            {"delivery_id", g_delivery_id},
-            {"status",      "completed"},
-            {"timestamp",   get_timestamp()}
-        };
-        pub("delivery/complete/" + g_vehicle_id + "/1to3", msg, 1);
-        printf("[MQTT] 배달 완료\n");
-    }
-
-protected:
-    void on_connect(int rc) override {
-        if (rc == 0) {
-            connected = true;
-            subscribe(nullptr, "delivery/command/+", 1);
-            subscribe(nullptr, "delivery/pin/+/3to1", 2);
-            printf("[MQTT] 연결됨 - 명령 대기 중\n");
-        }
-    }
-
-    void on_disconnect(int rc) override {
-        connected = false;
-        printf("[MQTT] 연결 끊김 rc=%d\n", rc);
-    }
-
-    void on_message(const struct mosquitto_message* msg) override {
-        std::string topic(msg->topic);
-        std::string payload((char*)msg->payload, msg->payloadlen);
-        try {
-            auto data = json::parse(payload);
-            if (topic.find("delivery/command/") != std::string::npos) {
-                std::string dest_str = data["destination"].get<std::string>();
-                int dest = (dest_str=="A")?1:(dest_str=="B")?2:
-                           (dest_str=="C")?3:4;
-                g_delivery_id = data.value("delivery_id", "");
-                g_destination = dest;
-                g_start_cmd   = true;
-                printf("\n[MQTT] 출동 명령! 목적지=%s delivery_id=%s\n",
-                       dest_str.c_str(), g_delivery_id.c_str());
-            }
-            if (topic.find("delivery/pin/") != std::string::npos &&
-                topic.find("3to1") != std::string::npos) {
-                g_delivery_id = data.value("delivery_id", "");
-                printf("[MQTT] PIN 수신 delivery_id=%s\n", g_delivery_id.c_str());
-            }
-        } catch (...) {}
-    }
-};
-
 // ===================== 메인 =====================
 int main(int argc, char* argv[]) {
     std::string broker_host = "10.42.0.1";
     if (argc > 1) broker_host = argv[1];
 
-    printf("=== 배달 차량 (라인트레이싱 + MQTT) ===\n");
+    printf("=== 배달 차량 (라인트레이싱 + MQTT + 적재함ECU) ===\n");
     printf("목적지: A=1 B=2 C=3 D=4\n");
     printf("키: q=종료 e=E-Stop 1/2/3/4=수동목적지설정\n");
     printf("브로커: %s\n\n", broker_host.c_str());
@@ -461,10 +547,12 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < 2; i++) cap.grab();
         if (!cap.retrieve(frame) || frame.empty()) continue;
 
-        uint64_t t  = now_ms();
-        uint64_t dt = t - state_ts;
+        uint64_t t   = now_ms();
+        uint64_t dt  = t - state_ts;
         uint8_t  cmd = DIR_STOP;
         cv::Mat  vis = frame.clone();
+
+        recv_can(sock, mqtt);
 
         // ── 키 입력 ──
         {
@@ -487,44 +575,55 @@ int main(int argc, char* argv[]) {
 
         case S_WAIT_CMD:
             cmd = DIR_STOP;
+            if ((t - last_tx) >= 50) {
+                send_cmd(sock, DIR_STOP, 0);
+                last_tx = t;
+            }
             if (g_start_cmd) {
-                g_start_cmd = false;
-                dest        = g_destination.load();
-                junc_count  = 0;
-                streak      = 0;
-                returning   = false;
-                start_ts    = t;
-                last_junc   = t;
-                state       = S_FOLLOW;
-                state_ts    = t;
+                g_start_cmd   = false;
+                g_door_closed = false;
+                dest          = g_destination.load();
+                junc_count    = 0;
+                streak        = 0;
+                returning     = false;
+                start_ts      = t;
+                last_junc     = t;
+                state         = S_FOLLOW;
+                state_ts      = t;
                 const char* dn = (dest==1)?"A":(dest==2)?"B":(dest==3)?"C":"D";
-                printf("\n[출발] 목적지: %s (%dms 후 교차로 감지)\n", dn, JUNC_START_DELAY);
+                printf("\n[출발] 목적지: %s\n", dn);
+                send_cargo_info(sock, mqtt.last_pin, dest);
                 mqtt.send_start(dest);
             }
             break;
 
         case S_FOLLOW: {
             int aid = detect_aruco(frame);
+
             if (!returning && dest > 0 && aid == get_target_aruco(dest)) {
+                printf("\n[도착] ArUco ID=%d 감지! 즉시 정지\n", aid);
+                send_stop_blocking(sock);
+                last_tx  = 0;
+                send_cargo_arrival(sock);
+                g_door_closed = false;
                 state    = S_DELIVER_WAIT;
                 state_ts = t;
-                cmd      = DIR_STOP;
-                printf("\n[도착!] ArUco ID=%d 감지 → 정지\n", aid);
                 mqtt.send_arrived(dest);
-                break;
-            }
-            if (returning && aid == 0) {
-                state    = S_FINISHED;
-                state_ts = t;
-                cmd      = DIR_STOP;
-                printf("\n[복귀 완료] ArUco ID=0 감지!\n");
+                printf("[대기] PIN 인증 후 도어 닫힘 대기 중...\n");
                 break;
             }
 
-            // 교차로 감지 ROI
+            if (returning && aid == 0) {
+                printf("\n[복귀 완료] ArUco ID=0 감지!\n");
+                send_stop_blocking(sock);
+                last_tx  = 0;
+                state    = S_FINISHED;
+                state_ts = t;
+                break;
+            }
+
             int H = frame.rows, W = frame.cols;
-            int yj0 = (int)(H * 0.40);
-            int yj1 = (int)(H * 0.62);
+            int yj0 = (int)(H * 0.40), yj1 = (int)(H * 0.62);
             cv::Mat jroi = frame(cv::Rect(0, yj0, W, yj1 - yj0));
 
             cv::Mat gray, blur, bin;
@@ -544,7 +643,6 @@ int main(int argc, char* argv[]) {
             else if (!cool || !start_ok)           streak = 0;
             else                                   streak = std::max(0, streak - 1);
 
-            // 시각화
             cv::rectangle(vis, cv::Point(0, yj0), cv::Point(W, yj1),
                           cv::Scalar(255, 0, 255), 2);
             cv::line(vis, cv::Point(W/3,   yj0), cv::Point(W/3,   yj1), cv::Scalar(255,255,0), 1);
@@ -575,23 +673,28 @@ int main(int argc, char* argv[]) {
 
                 const char* an = (action==DIR_FORWARD)?"직진":
                                  (action==DIR_LEFT)?"좌회전":"우회전";
-                printf("\n[교차로 %d번째] %s → %s (L=%.2f M=%.2f R=%.2f)\n",
-                       junc_count, returning?"복귀":"GO", an, rL, rM, rR);
+                printf("\n[교차로 %d번째] DEST:%d %s → %s (L=%.2f M=%.2f R=%.2f)\n",
+                       junc_count, dest, returning?"복귀":"GO", an, rL, rM, rR);
 
                 g_next_action = action;
-                state         = S_JUNC_STOP;
-                state_ts      = t;
-                cmd           = DIR_STOP;
+                send_stop_blocking(sock);
+                last_tx  = 0;
+                state    = S_JUNC_STOP;
+                state_ts = t;
                 break;
             }
 
-            // 라인트레이싱
             int err = 0;
             cmd = follow_line(frame, err, vis);
+            if ((t - last_tx) >= 50) {
+                float tx_rpm = (cmd == DIR_STOP) ? 0.0f : g_rpm;
+                send_cmd(sock, cmd, tx_rpm);
+                last_tx = t;
+            }
             if ((t - last_tx) >= 200) {
                 const char* d = (cmd==DIR_FORWARD)?"ST":(cmd==DIR_LEFT)?"L":"R";
-                printf("\r[%s err=%4d] DEST:%d %s JUNC:%d",
-                       d, err, dest, returning?"RET":"GO", junc_count);
+                printf("\r[%s err=%4d] DEST:%d %s JUNC:%d RPM:%.0f",
+                       d, err, dest, returning?"RET":"GO", junc_count, g_rpm);
                 fflush(stdout);
             }
             break;
@@ -599,6 +702,10 @@ int main(int argc, char* argv[]) {
 
         case S_JUNC_STOP:
             cmd = DIR_STOP;
+            if ((t - last_tx) >= 50) {
+                send_cmd(sock, DIR_STOP, 0);
+                last_tx = t;
+            }
             if (dt >= DUR_JUNC_STOP_MS) {
                 if      (g_next_action == DIR_FORWARD) state = S_JUNC_STRAIGHT;
                 else if (g_next_action == DIR_LEFT)    state = S_JUNC_LEFT;
@@ -611,20 +718,24 @@ int main(int argc, char* argv[]) {
             break;
 
         case S_JUNC_STRAIGHT:
+            cmd = DIR_FORWARD;
             if ((t - last_tx) >= 50) {
                 send_cmd(sock, DIR_FORWARD, DEFAULT_RPM);
                 last_tx = t;
             }
-            cmd = DIR_FORWARD;
-            if (dt >= DUR_STRAIGHT_MS) { state = S_REACQUIRE; state_ts = t; }
+            if (dt >= DUR_STRAIGHT_MS) {
+                state    = S_REACQUIRE;
+                state_ts = t;
+                printf("\n[직진 완료] 라인 재탐색\n");
+            }
             break;
 
         case S_JUNC_LEFT:
+            cmd = DIR_LEFT;
             if ((t - last_tx) >= 50) {
                 send_cmd(sock, DIR_LEFT, TURN_RPM);
                 last_tx = t;
             }
-            cmd = DIR_LEFT;
             if (dt >= DUR_TURN_MS) {
                 state    = S_REACQUIRE;
                 state_ts = t;
@@ -633,11 +744,11 @@ int main(int argc, char* argv[]) {
             break;
 
         case S_JUNC_RIGHT:
+            cmd = DIR_RIGHT;
             if ((t - last_tx) >= 50) {
                 send_cmd(sock, DIR_RIGHT, TURN_RPM);
                 last_tx = t;
             }
-            cmd = DIR_RIGHT;
             if (dt >= DUR_TURN_MS) {
                 state    = S_REACQUIRE;
                 state_ts = t;
@@ -646,60 +757,96 @@ int main(int argc, char* argv[]) {
             break;
 
         case S_REACQUIRE: {
-            int err = 0;
-            cmd = follow_line(frame, err, vis);
+            // 1단계: 500ms 정지
+            if (dt < 500) {
+                if ((t - last_tx) >= 50) {
+                    send_cmd(sock, DIR_STOP, 0);
+                    last_tx = t;
+                }
+                printf("\r[재탐색 정지] %.1fs", dt / 1000.0f);
+                fflush(stdout);
+                break;
+            }
+            // 2단계: 느리게 직진으로 라인 올라타기
             if ((t - last_tx) >= 50) {
-                send_cmd(sock, cmd, DEFAULT_RPM);
+                send_cmd(sock, DIR_FORWARD, 50.0f);
                 last_tx = t;
             }
-            if (dt >= DUR_REACQ_MS) {
-                // 회전 후 복귀할 때도 딜레이 적용
+            if (dt >= DUR_REACQ_MS + 500) {
+                start_ts = t;
+                state    = S_FOLLOW;
+                state_ts = t;
+                printf("\n[라인 복귀 완료]\n");
+            }
+            break;
+        }
+
+        case S_REACQUIRE_AFTER_UTURN: {
+            cmd = DIR_FORWARD;
+            if ((t - last_tx) >= 50) {
+                send_cmd(sock, DIR_FORWARD, DEFAULT_RPM);
+                last_tx = t;
+            }
+            printf("\r[유턴 후 직진] %.1f / %.1fs",
+                   dt / 1000.0f, DUR_REACQ_UTURN_MS / 1000.0f);
+            fflush(stdout);
+            if (dt >= DUR_REACQ_UTURN_MS) {
                 start_ts  = t;
+                last_junc = t;
                 state     = S_FOLLOW;
                 state_ts  = t;
+                printf("\n[라인 복귀] 추적 시작\n");
             }
             break;
         }
 
         case S_DELIVER_WAIT:
             cmd = DIR_STOP;
-            {
-                int remain = (dt < DELIVER_WAIT_MS) ?
-                             (int)((DELIVER_WAIT_MS - dt) / 1000) + 1 : 0;
-                printf("\r[배달 대기] %d초   ", remain);
-                fflush(stdout);
-                char ws[32];
-                snprintf(ws, sizeof(ws), "WAIT %ds", remain);
-                cv::putText(vis, ws, cv::Point(10, 120),
-                            cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0,255,255), 2);
+            if ((t - last_tx) >= 50) {
+                send_cmd(sock, DIR_STOP, 0);
+                last_tx = t;
             }
-            if (dt >= DELIVER_WAIT_MS) {
+            {
+                uint64_t wait_sec = dt / 1000;
+                printf("\r[PIN 인증 대기] %llus 경과 (도어 닫히면 출발)  ",
+                       (unsigned long long)wait_sec);
+                fflush(stdout);
+                char ws[48];
+                snprintf(ws, sizeof(ws), "WAIT PIN %llus", (unsigned long long)wait_sec);
+                cv::putText(vis, ws, cv::Point(10, 120),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0,255,255), 2);
+            }
+            if (g_door_closed) {
+                printf("\n[도어 닫힘] 유턴 시작!\n");
+                g_door_closed = false;
                 state    = S_UTURN;
                 state_ts = t;
-                printf("\n[U턴] 복귀 시작\n");
-                mqtt.send_arrived(dest);
+                last_tx  = 0;
             }
             break;
 
         case S_UTURN:
+            cmd = DIR_UTURN;
             if ((t - last_tx) >= 50) {
                 send_cmd(sock, DIR_UTURN, TURN_RPM);
                 last_tx = t;
             }
-            cmd = DIR_UTURN;
+            printf("\r[U턴 중] %.1f / %.1fs",
+                   dt / 1000.0f, DUR_UTURN_MS / 1000.0f);
+            fflush(stdout);
             if (dt >= DUR_UTURN_MS) {
+                send_stop_blocking(sock);
+                last_tx    = 0;
                 returning  = true;
                 junc_count = 0;
-                start_ts   = t;
-                last_junc  = t;
-                state      = S_REACQUIRE;
+                state      = S_REACQUIRE_AFTER_UTURN;
                 state_ts   = t;
-                printf("\n[복귀 모드] 시작\n");
+                printf("\n[U턴 완료] 직진으로 라인 복귀\n");
             }
             break;
 
         case S_FINISHED:
-            send_cmd(sock, DIR_STOP, 0);
+            send_stop_blocking(sock);
             mqtt.send_complete();
             printf("\n==============================\n");
             printf("        배달 완료!\n");
@@ -709,29 +856,25 @@ int main(int argc, char* argv[]) {
             returning     = false;
             g_destination = 0;
             g_delivery_id = "";
+            g_door_closed = false;
             state         = S_WAIT_CMD;
+            state_ts      = t;
             printf("다음 배달 명령 대기 중...\n");
             break;
         }
 
-        // CAN 공통 송신
-        if ((t - last_tx) >= 50) {
-            float tx_rpm = (cmd == DIR_STOP) ? 0.0f : g_rpm;
-            send_cmd(sock, cmd, tx_rpm);
-            last_tx = t;
-        }
-
         // ── 시각화 ──
         const char* stname =
-            (state == S_WAIT_CMD)      ? "WAIT"     :
-            (state == S_FOLLOW)        ? "FOLLOW"   :
-            (state == S_JUNC_STOP)     ? "JUNC_STP" :
-            (state == S_JUNC_STRAIGHT) ? "JUNC_ST"  :
-            (state == S_JUNC_LEFT)     ? "JUNC_L"   :
-            (state == S_JUNC_RIGHT)    ? "JUNC_R"   :
-            (state == S_REACQUIRE)     ? "REACQ"    :
-            (state == S_DELIVER_WAIT)  ? "DELIVER"  :
-            (state == S_UTURN)         ? "UTURN"    : "FINISH";
+            (state == S_WAIT_CMD)             ? "WAIT"      :
+            (state == S_FOLLOW)               ? "FOLLOW"    :
+            (state == S_JUNC_STOP)            ? "JUNC_STP"  :
+            (state == S_JUNC_STRAIGHT)        ? "JUNC_ST"   :
+            (state == S_JUNC_LEFT)            ? "JUNC_L"    :
+            (state == S_JUNC_RIGHT)           ? "JUNC_R"    :
+            (state == S_REACQUIRE)            ? "REACQ"     :
+            (state == S_REACQUIRE_AFTER_UTURN)? "REACQ_UTN" :
+            (state == S_DELIVER_WAIT)         ? "DELIVER"   :
+            (state == S_UTURN)                ? "UTURN"     : "FINISH";
 
         const char* dn = (dest==1)?"A":(dest==2)?"B":(dest==3)?"C":(dest==4)?"D":"?";
 
@@ -742,15 +885,14 @@ int main(int argc, char* argv[]) {
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0,255,0), 2);
 
         char info[64];
-        snprintf(info, sizeof(info), "J:%d TURN:%dms HT:%.2f/%.2f",
-                 junc_count, DUR_TURN_MS, HIGH_TH, HIGH_TH_ONE);
+        snprintf(info, sizeof(info), "J:%d UTN:%dms DOOR:%s",
+                 junc_count, DUR_UTURN_MS,
+                 g_door_closed ? "CLOSED" : "OPEN");
         cv::putText(vis, info, cv::Point(10, 68),
                     cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255,200,0), 1);
 
         cv::imshow("Delivery", vis);
         if ((cv::waitKey(1) & 0xFF) == 'q') { send_estop(sock); break; }
-
-        usleep(5000);
     }
 
 exit_loop:

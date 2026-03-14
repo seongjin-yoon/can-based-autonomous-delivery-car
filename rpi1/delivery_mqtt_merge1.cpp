@@ -344,7 +344,7 @@ protected:
             connected = true;
             // ★ RPi3가 보내는 토픽 구독
             subscribe(nullptr,
-                ("delivery/vehicle/" + g_vehicle_id + "/destination").c_str(), 1);
+                ("delivery/vehicle/" + g_vehicle_id + "/order").c_str(), 1);
             printf("[MQTT] 연결됨 - 명령 대기 중\n");
             printf("[MQTT] 구독: delivery/vehicle/%s/destination\n",
                    g_vehicle_id.c_str());
@@ -362,7 +362,7 @@ protected:
         try {
             auto data = json::parse(payload);
             // ★ RPi3 토픽: delivery/vehicle/vehicle_001/destination
-            if (topic.find("/destination") != std::string::npos) {
+            if (topic.find("/order") != std::string::npos) {
                 std::string dest_str = data["destination"].get<std::string>();
                 int dest = (dest_str=="A")?1:(dest_str=="B")?2:
                            (dest_str=="C")?3:4;
