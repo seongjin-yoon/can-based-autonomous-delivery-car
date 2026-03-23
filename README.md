@@ -24,23 +24,10 @@
 
 ## 🏗️ Architecture
 
-<!-- 📷 PPT H/W Architecture 이미지 삽입 권장 -->
+<img width="1288" height="724" alt="image" src="https://github.com/user-attachments/assets/26e2644e-fd0b-4f99-94f2-86e4d59569b4" />
+
 <!-- ![HW Architecture](./assets/hw_architecture.png) -->
 
-```
-┌─────────────────────────────────────────────┐
-│               RC카 (온보드)                 │
-│                                             │
-│  STM32 (B-L475E) ─────┐                     │
-│  주행 ECU              │                    │
-│                       CAN Bus (250 kbps)    │
-│  RPi1 ────────────────┤                     │
-│  미션 ECU              │   Wi-Fi / MQTT     │
-│                       │   └──────────────── ┼──→ RPi3 (서버)
-│  STM103 ──────────────┘                     │         │
-│  화물함 ECU                                 │         │ MQTT
-└─────────────────────────────────────────────┘     RPi4 (클라이언트)
-```
 
 | 노드 | 보드 | 역할 | 설계 원칙 |
 |---|---|---|---|
@@ -54,8 +41,8 @@
 
 ## 🔄 System Flow
 
-<!-- 📷 플로우차트 이미지 삽입 권장 -->
-<!-- ![Flow Chart](./assets/flowchart.png) -->
+<img width="5606" height="5120" alt="image" src="https://github.com/user-attachments/assets/3ed64dd9-4340-49b7-89f1-d8f428654d60" />
+
 
 ```
 [RPi4] 목적지 + PIN 설정 → MQTT
@@ -87,6 +74,9 @@
 
 통신 속도: **250 kbps** / 버스 점유율 1% 미만 / 직선(데이지체인) 구조 필수
 
+<img width="865" height="479" alt="image" src="https://github.com/user-attachments/assets/ffa7a1af-9311-4b54-933e-d6e92d94f741" />
+
+
 | CAN ID | 내용 | 송신 | 수신 | 주기 |
 |---|---|---|---|---|
 | **0x010** | 주행 명령 (방향 + RPM) | RPi1 | STM32 | 50 ms |
@@ -104,6 +94,8 @@
 ---
 
 ## 🌐 MQTT Topics
+
+<img width="1448" height="724" alt="image" src="https://github.com/user-attachments/assets/73377464-8539-4038-8709-2cadfba29199" />
 
 | 토픽 | 방향 | 내용 |
 |---|---|---|
@@ -216,7 +208,19 @@ sudo ip link set can0 txqueuelen 1000   # TX 큐 확장
 <!-- 📷 시연 영상 GIF 또는 썸네일 이미지 삽입 권장 -->
 <!-- [![Demo](./assets/demo_thumbnail.jpg)](영상_링크) -->
 
-[🎬 시연 영상 보기](https://www.notion.so/hiawath/CAN-2d0c59623e618065b6c2e65015a95234)
+[🎬 시연 영상 보기]([https://www.notion.so/hiawath/CAN-2d0c59623e618065b6c2e65015a95234](https://www.notion.so/31eea995ce3b804a9e87f27209502f0e?source=copy_link#32cea995ce3b8059ab3bd7d488b34fa6))
+
+---
+
+## HW
+
+<img width="720" height="960" alt="image" src="https://github.com/user-attachments/assets/7d712de1-0a84-4beb-997a-abbd668f20a9" />
+
+<img width="960" height="720" alt="image" src="https://github.com/user-attachments/assets/933c90ff-2e91-4893-9d10-d06cf9084189" />
+
+<img width="960" height="720" alt="image" src="https://github.com/user-attachments/assets/83e80d40-ada9-42f2-af96-0cb37033c2df" />
+
+
 
 ---
 
@@ -226,9 +230,11 @@ sudo ip link set can0 txqueuelen 1000   # TX 큐 확장
 |---|---|
 | PM | 프로젝트 주제 제안, 전체 일정 관리, 팀 노션 문서 구조 설계, 프로젝트 총 정리본 작성·유지 (v9.5) |
 | 아키텍처 설계 | 차량 탑재 3개 노드 보드 선정, 화물함 ECU RPi → STM32F103 교체 결정, CAN 단일 버스 + MQTT 게이트웨이 구조 확정 |
+| 하드웨어 배선 | B-L475E / STMF103 핀맵 확정 후 SN65HVD230 트랜시버 · 레벨시프터 · L298N · 엔코더 모터 실물 배선 및 선 정리, CAN 버스 데이지체인 구성 |
 | STM32 주행 ECU | B-L475E 온보드 핀 충돌 분석 및 핀맵 재설계, 모터 PWM / 엔코더 RPM / 속도 PID / CAN 통신 구현 |
 | MangoM32 CAN 검증 | 외부 디버거(NUCLEO ST-Link) 설정, Silent Loopback → Loopback → Normal 단계별 검증, 트랜시버 불량 + 종단저항 중복 문제 해결 |
 | 통합 지원 | 라인트레이싱 + ArUco 막바지 코드 수정 지원, 발표 진행 |
+
 
 ---
 
