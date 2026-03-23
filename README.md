@@ -208,7 +208,7 @@ sudo ip link set can0 txqueuelen 1000   # TX 큐 확장
 <!-- 📷 시연 영상 GIF 또는 썸네일 이미지 삽입 권장 -->
 <!-- [![Demo](./assets/demo_thumbnail.jpg)](영상_링크) -->
 
-[🎬 시연 영상 보기]([https://www.notion.so/hiawath/CAN-2d0c59623e618065b6c2e65015a95234](https://www.notion.so/31eea995ce3b804a9e87f27209502f0e?source=copy_link#32cea995ce3b8059ab3bd7d488b34fa6))
+[🎬 시연 영상 보기](https://www.notion.so/31eea995ce3b804a9e87f27209502f0e?source=copy_link#32cea995ce3b8059ab3bd7d488b34fa6)
 
 ---
 
