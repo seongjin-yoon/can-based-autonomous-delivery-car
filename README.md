@@ -3,7 +3,9 @@
 > STM32 × 2 + Raspberry Pi × 3 분산 ECU 아키텍처 기반 자율주행 무인 배달 RC카  
 > Intel AI SW Academy 9기 1차 팀 프로젝트 (2026.02 ~ 2026.03)
 
-<img src="https://github.com/user-attachments/assets/0eda7cee-d8d6-43c6-a70b-e2bf9ca94dab" width="400"/>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/0eda7cee-d8d6-43c6-a70b-e2bf9ca94dab" width="350"/>
+</p>
 
 <!-- ![CATNIP RC Car](./assets/car_photo.jpg) -->
 
