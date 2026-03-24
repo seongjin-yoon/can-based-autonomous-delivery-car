@@ -11,6 +11,45 @@
 
 ---
 
+## 💡 Motivation
+
+<p align="center">
+  <img src="assets/market.png" width="600"/>
+</p>
+
+- 배달 시장은 지속적으로 성장
+- 중앙집중 구조의 한계 존재
+- 차량 전장 시스템은 분산 ECU 구조 사용
+
+👉 목표:
+"소프트웨어가 아니라 구조를 설계하는 프로젝트"
+
+---
+
+## 📌 Key Features
+
+- CAN 기반 실시간 분산 ECU 제어
+- Vision + Control 완전 분리 구조
+- Fail-safe 설계 (Watchdog + CAN Timeout)
+
+---
+
+## 🚀 Quick Start
+
+```bash
+# 1. RPi1 실행
+./delivery 10.42.0.1
+
+# 2. 서버 실행
+./delivery_server
+
+# 3. CAN 활성화
+sudo ip link set can0 up type can bitrate 250000
+```
+
+
+---
+
 ## 🔧 Tech Stack
 
 ![C](https://img.shields.io/badge/C-A8B9CC?style=flat-square&logo=c&logoColor=white)
@@ -22,6 +61,7 @@
 ![MQTT](https://img.shields.io/badge/MQTT-660066?style=flat-square&logo=mqtt&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white)
 ![CAN Bus](https://img.shields.io/badge/CAN%20Bus-250kbps-blue?style=flat-square)
+
 
 ---
 
