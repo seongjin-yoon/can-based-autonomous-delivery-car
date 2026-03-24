@@ -26,6 +26,16 @@
 ![SQLite](https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white)
 ![CAN Bus](https://img.shields.io/badge/CAN%20Bus-250kbps-blue?style=flat-square)
 
+---
+
+## 🎥 Demo
+
+<p align="center">
+  <a href="https://youtu.be/Z4IQcvlYzos">
+    <img src="https://img.youtube.com/vi/Z4IQcvlYzos/0.jpg" width="700">
+  </a>
+</p>
+
 
 ---
 
@@ -56,15 +66,6 @@ RC카 환경에서 CAN 기반 분산 ECU 아키텍처를 설계하고 검증하�
 - Vision + Control 완전 분리 구조
 - Fail-safe 설계 (Watchdog + CAN Timeout)
 
----
-
-## 🎥 Demo
-
-<p align="center">
-  <a href="https://youtu.be/Z4IQcvlYzos">
-    <img src="https://img.youtube.com/vi/Z4IQcvlYzos/0.jpg" width="700">
-  </a>
-</p>
 
 ---
 
