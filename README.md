@@ -13,9 +13,7 @@
 
 ## 💡 Motivation
 
-<p align="center">
-  <img src="assets/market.png" width="600"/>
-</p>
+![Market](assets/market.png)
 
 - 배달 시장은 지속적으로 성장
 - 중앙집중 구조의 한계 존재
