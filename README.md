@@ -44,8 +44,6 @@
 
 ![Flowchart](assets/flowchart.png)
 
-
-
 ```
 [RPi4] 목적지 + PIN 설정 → MQTT
          ↓
@@ -76,8 +74,8 @@
 
 통신 속도: **250 kbps** / 버스 점유율 1% 미만 / 직선(데이지체인) 구조 필수
 
-<img width="865" height="479" alt="image" src="https://github.com/user-attachments/assets/ffa7a1af-9311-4b54-933e-d6e92d94f741" />
 
+![CAN Connection](assets/can_connect.png)
 
 | CAN ID | 내용 | 송신 | 수신 | 주기 |
 |---|---|---|---|---|
@@ -96,8 +94,6 @@
 ---
 
 ## 🌐 MQTT Topics
-
-<img width="1448" height="724" alt="image" src="https://github.com/user-attachments/assets/73377464-8539-4038-8709-2cadfba29199" />
 
 | 토픽 | 방향 | 내용 |
 |---|---|---|
@@ -133,6 +129,11 @@
 ## 🛠️ STM32 주행 ECU 상세
 
 ### 핀맵
+
+
+![stml4 pin map](assets/stml4.png)
+
+![stmf103 pin map](assets/stmf103.png)
 
 | 기능 | 핀 | CubeMX 설정 | 연결 대상 |
 |---|---|---|---|
