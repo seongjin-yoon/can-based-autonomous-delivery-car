@@ -27,9 +27,7 @@
 
 ## 🏗️ Architecture
 
-<img width="1288" height="724" alt="image" src="https://github.com/user-attachments/assets/26e2644e-fd0b-4f99-94f2-86e4d59569b4" />
-
-<!-- ![HW Architecture](./assets/hw_architecture.png) -->
+![HW Architecture](assets/hw_architecture.png)
 
 
 | 노드 | 보드 | 역할 | 설계 원칙 |
@@ -44,7 +42,8 @@
 
 ## 🔄 System Flow
 
-<img width="5606" height="5120" alt="image" src="https://github.com/user-attachments/assets/3ed64dd9-4340-49b7-89f1-d8f428654d60" />
+![Flowchart](assets/flowchart.png)
+
 
 
 ```
