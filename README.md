@@ -26,15 +26,6 @@
 ![SQLite](https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white)
 ![CAN Bus](https://img.shields.io/badge/CAN%20Bus-250kbps-blue?style=flat-square)
 
----
-
-## 🎥 Demo
-
-<p align="center">
-  <a href="https://youtu.be/Z4IQcvlYzos">
-    <img src="https://img.youtube.com/vi/Z4IQcvlYzos/0.jpg" width="700">
-  </a>
-</p>
 
 
 ---
@@ -269,10 +260,13 @@ sudo ip link set can0 txqueuelen 1000   # TX 큐 확장
 
 ## 📹 시연 영상
 
-<!-- 📷 시연 영상 GIF 또는 썸네일 이미지 삽입 권장 -->
-<!-- [![Demo](./assets/demo_thumbnail.jpg)](영상_링크) -->
 
-[🎬 시연 영상 보기](https://www.notion.so/31eea995ce3b804a9e87f27209502f0e?source=copy_link#32cea995ce3b8059ab3bd7d488b34fa6)
+<p align="center">
+  <a href="https://youtu.be/Z4IQcvlYzos">
+    <img src="https://img.youtube.com/vi/Z4IQcvlYzos/0.jpg" width="700">
+  </a>
+</p>
+
 
 ---
 
