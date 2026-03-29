@@ -115,7 +115,7 @@ sudo apt install libmosquitto-dev libmosquittopp-dev libsqlite3-dev
 ### 빌드
 
 ```bash
-g++ -std=c++17 delivery_server.cpp -o delivery_server \
+g++ -std=c++17 server_rpi.cpp -o delivery_server \
     -lmosquitto -lmosquittopp -lsqlite3
 ```
 
