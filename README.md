@@ -84,11 +84,11 @@ sudo ip link set can0 up type can bitrate 250000
 
 | 노드 | 보드 | 역할 | 설계 원칙 |
 |---|---|---|---|
-| STM32 | B-L475E-IOT01A (STM32L4) | 주행 ECU — 모터 / 엔코더 / PID | 판단하지 않는다. 명령 수행 + 센서 수집만 |
-| RPi1 | Raspberry Pi | 미션 ECU — 라인트레이싱 / ArUco / MQTT | 모든 판단은 여기서 한다 |
-| STM103 | STM32F103 (MangoM32) | 화물함 ECU — PIN 인증 / 서보 / LCD | 주행 ECU와 완전 독립된 보안 영역 |
-| RPi3 | Raspberry Pi | MQTT 브로커 / 주문 중계 / SQLite | 실시간 제어에 절대 관여하지 않는다 |
-| RPi4 | Raspberry Pi | Qt 주문 UI / 5인치 터치 디스플레이 | 고객 주문 접수 및 PIN 설정 |
+| STM32L4 | B-L475E-IOT01A (STM32L4) | 주행 ECU — 모터 / 엔코더 / PID | 판단하지 않는다. 명령 수행 + 센서 수집만 |
+| RPi1 | Raspberry Pi 5 | 미션 ECU — 라인트레이싱 / ArUco / MQTT | 모든 판단은 여기서 한다 |
+| STMF103 | MangoM32 (STM32F103) | 화물함 ECU — PIN 인증 / 서보 / LCD | 주행 ECU와 완전 독립된 보안 영역 |
+| RPi3 | Raspberry Pi 5 | MQTT 브로커 / 주문 중계 / SQLite | 실시간 제어에 절대 관여하지 않는다 |
+| RPi4 | Raspberry Pi 5 | Qt 주문 UI / 5인치 터치 디스플레이 | 고객 주문 접수 및 PIN 설정 |
 
 ---
 
@@ -172,7 +172,6 @@ sudo ip link set can0 up type can bitrate 250000
 - 5회 실패 시 10초 잠금, 30초 미수령 시 자동 귀환
 
 **Fail-safe**
-- STM32 IWDG 300ms → RPi1 다운 시 MCU 리셋 + 모터 즉시 정지
 - CAN 명령 5초 미수신 → `Motor_Stop()` 자동 실행
 - `Motor_Stop()` 브레이크 모드: IN1=IN2=HIGH, IN3=IN4=HIGH (coast 방지)
 
