@@ -1,7 +1,7 @@
 # RPi4 — 클라이언트 (Qt Client)
 > **CAN 기반 분산 ECU 무인 배달 차량 시스템** | CATNIP 팀
 
-![order_client](assets/delivery_client.gif)
+![client_interface](assets/client.png)
 
 ---
 
