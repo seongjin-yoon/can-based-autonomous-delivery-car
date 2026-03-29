@@ -99,14 +99,19 @@ IP:       10.42.0.1  (Pi5_MQTT_AP 핫스팟)
 ---
 
 ## 상태머신 요약
-
 ```
-S_WAIT_CMD → (MQTT 출동 명령) → S_FOLLOW
-S_FOLLOW   → (교차로 감지)   → S_JUNC_STOP → S_JUNC_LEFT/RIGHT/STRAIGHT → S_REACQUIRE → S_FOLLOW
-S_FOLLOW   → (ArUco 도착)    → S_DELIVER_WAIT
-S_DELIVER_WAIT → (CAN 0x301/0x302) → S_UTURN
-S_UTURN    → S_REACQUIRE_AFTER_UTURN → S_FOLLOW (returning=true)
-S_FOLLOW   → (ArUco ID=0)   → S_FINISHED → S_WAIT_CMD
+S_WAIT_CMD   → (MQTT 출동 명령)      → S_FOLLOW
+S_FOLLOW     → (교차로 감지)         → S_JUNC_STOP
+                                    → S_JUNC_LEFT/RIGHT/STRAIGHT
+                                    → S_REACQUIRE
+                                    → S_REACQ_STABLE
+                                    → S_FOLLOW
+S_FOLLOW     → (ArUco 도착)          → S_DELIVER_WAIT
+S_DELIVER_WAIT → (CAN 0x301/0x302)  → S_PRE_UTURN (도어 닫힘 후 직진 2.5초)
+S_PRE_UTURN  → (2.5초 경과)          → S_UTURN
+S_UTURN      → (라인 감지 or 타임아웃) → S_REACQUIRE_AFTER_UTURN
+S_REACQUIRE_AFTER_UTURN → S_FOLLOW (returning=true)
+S_FOLLOW     → (ArUco ID=0)          → S_FINISHED → S_WAIT_CMD
 ```
 
 ---
@@ -114,13 +119,13 @@ S_FOLLOW   → (ArUco ID=0)   → S_FINISHED → S_WAIT_CMD
 ## 주요 파라미터
 
 ```cpp
-#define DEFAULT_RPM        40.0f    // 라인트레이싱 기본 속도
+#define DEFAULT_RPM        50.0f    // 라인트레이싱 기본 속도
 #define TURN_RPM          150.0f    // 교차로 회전 속도
 #define STRAIGHT_DEADBAND   50      // 직진 판단 오차 허용 (px)
 #define JUNC_STREAK          2      // 교차로 연속 감지 임계값
 #define DUR_JUNC_STOP_MS   800      // 교차로 정지 시간 (ms)
-#define DUR_TURN_MS       4000      // 좌/우회전 시간 (ms)
-#define DUR_UTURN_MS     12000      // U턴 시간 (ms)
+#define DUR_TURN_MS       3000      // 좌/우회전 시간 (ms)
+#define DUR_UTURN_MS      3000      // U턴 시간 (ms), 타임 아웃은 12000
 ```
 
 ---
@@ -146,7 +151,7 @@ sudo ip link set can0 up type can bitrate 250000
 ### 빌드
 
 ```bash
-g++ delivery40.cpp -o delivery \
+g++ mission_ecu.cpp -o delivery \
     $(pkg-config --cflags --libs opencv4) \
     -lmosquittopp -lpthread
 ```
