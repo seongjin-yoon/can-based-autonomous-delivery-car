@@ -125,7 +125,7 @@ S_FOLLOW     → (ArUco ID=0)          → S_FINISHED → S_WAIT_CMD
 #define JUNC_STREAK          2      // 교차로 연속 감지 임계값
 #define DUR_JUNC_STOP_MS   800      // 교차로 정지 시간 (ms)
 #define DUR_TURN_MS       3000      // 좌/우회전 시간 (ms)
-#define DUR_UTURN_MS      3000      // U턴 시간 (ms), 타임 아웃은 12000
+#define DUR_UTURN_MS      3000      // U턴 시간 (ms), 타임 아웃만 12000
 ```
 
 ---
@@ -146,6 +146,12 @@ sudo apt install libopencv-dev libmosquitto-dev libmosquittopp-dev
 # dtoverlay=mcp2515-can0,oscillator=8000000,interrupt=25
 
 sudo ip link set can0 up type can bitrate 250000
+```
+
+### CAN 단독 테스트 (STM32 연결 확인용)
+
+```c
+gcc can_test.c -o can_test && ./can_test
 ```
 
 ### 빌드
