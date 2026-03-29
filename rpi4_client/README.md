@@ -1,7 +1,8 @@
 # RPi4 — 클라이언트 (Qt Client)
 > **CAN 기반 분산 ECU 무인 배달 차량 시스템** | CATNIP 팀
 
-![client_interface](assets/client.png)
+
+![client_interface](../assets/client.png)
 
 ---
 
@@ -24,7 +25,13 @@
 RPi4
 ├── 5인치 터치 디스플레이 (XPT2046) ── DSI / SPI 터치 입력
 └── Wi-Fi ──────────────────────────── MQTT → RPi3 (브로커: 10.42.0.1)
+
+// 터치 스크린의 가장 자리는 잘 터치되지 않는 하드웨어적 이슈 있었음
 ```
+
+<div align="center">
+  <img src="../assets/delivery_client.gif" alt="client_interface">
+</div>
 
 ---
 
