@@ -1,5 +1,4 @@
 # RPi4 — 클라이언트 (Qt Client)
-
 > **CAN 기반 분산 ECU 무인 배달 차량 시스템** | CATNIP 팀
 
 ---
@@ -24,6 +23,16 @@ RPi4
 ├── 5인치 터치 디스플레이 (XPT2046) ── DSI / SPI 터치 입력
 └── Wi-Fi ──────────────────────────── MQTT → RPi3 (브로커: 10.42.0.1)
 ```
+
+---
+
+## 디렉터리 구조
+
+| 디렉터리 | 설명 |
+|----------|------|
+| `catnip_client/MonitoringWithMenu/` | qmake 기반 Qt 프로젝트 (DeliveryUI.pro) |
+| `catnip_client/delivery_client/` | CMake 기반 Qt 프로젝트 |
+| `catnip_vehicle/` | 차량 제어 관련 코드 |
 
 ---
 
@@ -76,10 +85,19 @@ IP:       10.42.0.1  (Pi5_MQTT_AP 핫스팟)
 sudo apt install qt5-default libmosquitto-dev libmosquittopp-dev
 ```
 
-### 빌드
+### 빌드 (qmake 방식)
 
 ```bash
-qmake && make
+cd catnip_client/MonitoringWithMenu/MonitoringWithMenu/MonitoringWithMenu
+qmake DeliveryUI.pro && make
+```
+
+### 빌드 (CMake 방식)
+
+```bash
+cd catnip_client/delivery_client
+mkdir build && cd build
+cmake .. && make
 ```
 
 ### 실행
