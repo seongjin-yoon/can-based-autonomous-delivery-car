@@ -2,6 +2,8 @@
 
 > **CAN 기반 분산 ECU 무인 배달 차량 시스템** | CATNIP 팀
 
+![raspi5_hardware](../assets/raspberrypi5.png)
+
 ---
 
 ## 역할 및 개요
