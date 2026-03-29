@@ -2,7 +2,7 @@
 
 > **CAN 기반 분산 ECU 무인 배달 차량 시스템** | CATNIP 팀
 
-<p align="center">
+<p align="left">
   <img src="/assets/B-L475E-IOT01A2.png" width="500" />
 </p>
 
